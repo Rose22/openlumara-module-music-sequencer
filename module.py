@@ -12,6 +12,7 @@ INSTRUMENTS = ["piano", "bass", "pad", "lead", "pluck", "bells", "sine", "square
 BUILTIN_NAMES = set(DRUM_VOICES) | set(INSTRUMENTS)
 
 OSC_TYPES = ["sine", "square", "sawtooth", "triangle"]
+WT_TABLES = ["harmonics", "even", "sparse"]
 EFFECTS = ["flash", "ring", "bloom", "spark", "tick", "laser"]
 FILTER_TYPES = ["lowpass", "highpass", "bandpass"]
 SOUND_NAME_RE = re.compile(r"^[a-z][a-z0-9_\-]{0,31}$")
@@ -105,11 +106,13 @@ def _clean_sound_spec(spec):
         fm, err = _clean_fm(spec["fm"])
         if err:
             return None, err
+    engine_keys = ("fm", "pd", "ring", "wt", "chip", "grain")
     osc = spec.get("osc")
-    if osc is None and fm is not None:
+    has_engine = any(spec.get(e) is not None for e in engine_keys)
+    if osc is None and has_engine:
         osc = []
-    if not isinstance(osc, list) or len(osc) > 4 or (not osc and fm is None):
-        return None, "spec.osc must be a list of 1 to 4 oscillator layers (empty only when spec.fm is set)."
+    if not isinstance(osc, list) or len(osc) > 4 or (not osc and not has_engine):
+        return None, "spec.osc must be a list of 1 to 4 oscillator layers (empty only when an engine key is set: fm, pd, ring, wt, chip or grain)."
     clean_osc = []
     for i, layer in enumerate(osc):
         if not isinstance(layer, dict):
@@ -173,6 +176,72 @@ def _clean_sound_spec(spec):
         clean["pitch"] = {
             "glide": _num(p.get("glide"), 0.0, -36.0, 36.0),
             "glide_time": _num(p.get("glide_time"), 0.12, 0.005, 1.0),
+        }
+
+    if spec.get("pd") is not None:
+        p = spec["pd"]
+        if not isinstance(p, dict):
+            return None, "spec.pd must be a dict."
+        clean["pd"] = {
+            "shape": _num(p.get("shape"), 0.12, 0.02, 0.98),
+            "shape_end": _num(p.get("shape_end"), 0.5, 0.02, 0.98),
+            "decay": _num(p.get("decay"), 0.25, 0.01, 4.0),
+        }
+
+    if spec.get("ring") is not None:
+        r = spec["ring"]
+        if not isinstance(r, dict):
+            return None, "spec.ring must be a dict."
+        clean["ring"] = {
+            "ratio": _num(r.get("ratio"), 1.5, 0.05, 32.0),
+            "freq": _num(r.get("freq"), 0.0, 0.0, 20000.0),
+        }
+
+    if spec.get("wt") is not None:
+        w = spec["wt"]
+        if not isinstance(w, dict):
+            return None, "spec.wt must be a dict."
+        table = str(w.get("table", "harmonics")).strip().lower()
+        if table not in WT_TABLES:
+            return None, f"spec.wt.table must be one of: {', '.join(WT_TABLES)}."
+        clean["wt"] = {
+            "table": table,
+            "pos_start": _num(w.get("pos_start"), 0.05, 0.0, 1.0),
+            "pos_end": _num(w.get("pos_end"), 0.9, 0.0, 1.0),
+            "steps": int(_num(w.get("steps"), 8, 1, 24)),
+            "pos_time": _num(w.get("pos_time"), 0.4, 0.01, 4.0),
+        }
+
+    if spec.get("chip") is not None:
+        c = spec["chip"]
+        if not isinstance(c, dict):
+            return None, "spec.chip must be a dict."
+        arp = c.get("arp")
+        if arp is None:
+            arp = []
+        if not isinstance(arp, list) or len(arp) > 8:
+            return None, "spec.chip.arp must be a list of up to 8 semitone offsets."
+        chip = {
+            "duty": _num(c.get("duty"), 0.5, 0.03, 0.5),
+            "arp": [_num(x, 0.0, -48.0, 48.0) for x in arp],
+            "arp_rate": _num(c.get("arp_rate"), 25.0, 1.0, 100.0),
+        }
+        if c.get("duty_end") is not None:
+            chip["duty_end"] = _num(c.get("duty_end"), chip["duty"], 0.03, 0.5)
+        clean["chip"] = chip
+
+    if spec.get("grain") is not None:
+        g = spec["grain"]
+        if not isinstance(g, dict):
+            return None, "spec.grain must be a dict."
+        src = str(g.get("src", "sine")).strip().lower()
+        if src not in ("sine", "noise"):
+            return None, "spec.grain.src must be sine or noise."
+        clean["grain"] = {
+            "size": _num(g.get("size"), 0.08, 0.01, 1.0),
+            "rate": _num(g.get("rate"), 14.0, 1.0, 80.0),
+            "scatter": _num(g.get("scatter"), 0.015, 0.0, 0.2),
+            "src": src,
         }
     return clean, None
 
@@ -625,7 +694,7 @@ class MusicSequencerModule(core.module.Module):
 
         Args:
             name: Lowercase id, e.g. 'pew' or 'wobble'. Cannot shadow a built-in name.
-            spec: Recipe dict. Keys (only osc is required, unless fm is set): osc: list of 1-4 layers [{type: sine|square|sawtooth|triangle, level?: 0-1, octave?: -3..3, detune?: cents -100..100}]; fm?: full FM synth patch {operators: 1-6 dicts [{ratio?: 0.25-32 freq ratio to the played note, level?: 0-1 (mod depth for modulators, amp for carriers), feedback?: 0-0.9 self-modulation, attack?, decay?, sustain?: 0-1, release?}], algorithm: {modulator_index: carrier_index or list}, output: [carrier indexes]} - modulation depth scales with pitch like real FM; can coexist with osc layers; noise?: {level?: 0-1, filter?: lowpass|highpass|bandpass, freq?: 20-20000} blended noise layer; filter?: {type?: lowpass|highpass|bandpass, cutoff?: 20-20000, q?: 0-30, env?: sweep start offset in semitones above the cutoff, positive = falling sweep (-48..48), env_time?: seconds} - env around 24-36 gives classic plucks; env?: {attack?, decay?, sustain? 0-1, release?} in seconds (sustain only heard on held notes; a ping is attack 0.002 decay 0.4 sustain 0, a pad attack 0.3 decay 0.2 sustain 0.8 release 0.5); pitch?: {glide?: start offset in semitones above the note, positive = falling sweep (-36..36), glide_time?: seconds}; base_note?: MIDI number used as a drum voice (default 36). E.g. laser: {"osc": [{"type": "sawtooth"}], "pitch": {"glide": 24}, "filter": {"cutoff": 6000, "env": 36}, "env": {"attack": 0.002, "decay": 0.25}, "base_note": 72}
+            spec: Recipe dict. Keys (only osc is required, unless an engine key - fm, pd, ring, wt, chip or grain - is set): osc: list of 1-4 layers [{type: sine|square|sawtooth|triangle, level?: 0-1, octave?: -3..3, detune?: cents -100..100}]; fm?: full FM synth patch {operators: 1-6 dicts [{ratio?: 0.25-32 freq ratio to the played note, level?: 0-1 (mod depth for modulators, amp for carriers), feedback?: 0-0.9 self-modulation, attack?, decay?, sustain?: 0-1, release?}], algorithm: {modulator_index: carrier_index or list}, output: [carrier indexes]} - modulation depth scales with pitch like real FM; can coexist with osc layers; pd?: phase distortion, Casio CZ flavour {shape?: 0.02-0.98 warp (0.05 saw-bright, 0.5 hollow), shape_end?: settle target, decay?: settle seconds}; ring?: ring modulator over the whole voice {ratio?: mod freq relative to note (default 1.5) or freq?: absolute Hz} - stacks with any other engine, alone gets a sine carrier; wt?: wavetable sweep {table?: harmonics|even|sparse, pos_start?: 0-1, pos_end?: 0-1, steps?: 1-24, pos_time?: seconds}; chip?: NES pulse voice {duty?: 0.03-0.5, duty_end?: sweep target, arp?: up to 8 semitone offsets cycled as chip arpeggio, arp_rate?: 1-100 steps/s}; grain?: granular cloud of the note {size?: grain s (default 0.08), rate?: grains/s (default 14), scatter?: pitch jitter 0-0.2, src?: sine|noise}; noise?: {level?: 0-1, filter?: lowpass|highpass|bandpass, freq?: 20-20000} blended noise layer; filter?: {type?: lowpass|highpass|bandpass, cutoff?: 20-20000, q?: 0-30, env?: sweep start offset in semitones above the cutoff, positive = falling sweep (-48..48), env_time?: seconds} - env around 24-36 gives classic plucks; env?: {attack?, decay?, sustain? 0-1, release?} in seconds (sustain only heard on held notes; a ping is attack 0.002 decay 0.4 sustain 0, a pad attack 0.3 decay 0.2 sustain 0.8 release 0.5); pitch?: {glide?: start offset in semitones above the note, positive = falling sweep (-36..36), glide_time?: seconds}; base_note?: MIDI number used as a drum voice (default 36). E.g. laser: {"osc": [{"type": "sawtooth"}], "pitch": {"glide": 24}, "filter": {"cutoff": 6000, "env": 36}, "env": {"attack": 0.002, "decay": 0.25}, "base_note": 72}
         """
         chat_id = self._chat_id()
         if not chat_id:

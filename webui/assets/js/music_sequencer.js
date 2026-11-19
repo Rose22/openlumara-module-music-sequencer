@@ -80,11 +80,30 @@
                 ctx = new AC();
                 master = ctx.createGain();
                 master.gain.value = masterVolume / 100;
+                var shaper = ctx.createWaveShaper();
+                shaper.curve = tanhCurve(1.4);
                 var comp = ctx.createDynamicsCompressor();
-                comp.threshold.value = -14;
-                comp.ratio.value = 6;
-                master.connect(comp);
+                comp.threshold.value = -12;
+                comp.knee.value = 8;
+                comp.ratio.value = 3;
+                comp.attack.value = 0.008;
+                comp.release.value = 0.18;
+                master.connect(shaper);
+                shaper.connect(comp);
                 comp.connect(ctx.destination);
+                try {
+                    var verb = ctx.createConvolver();
+                    verb.buffer = makeIR(1.6, 3.2);
+                    var vhp = ctx.createBiquadFilter();
+                    vhp.type = "highpass";
+                    vhp.frequency.value = 220;
+                    var send = ctx.createGain();
+                    send.gain.value = 0.22;
+                    master.connect(vhp);
+                    vhp.connect(send);
+                    send.connect(verb);
+                    verb.connect(comp);
+                } catch (e) {}
                 ctx.onstatechange = onRunning;
             } catch (e) { return; }
         }
@@ -109,13 +128,38 @@
         return noiseBuf;
     }
 
-    function env(when, peak, attack, decay) {
+    function env(when, peak, attack, decay, dest) {
         var g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, when);
         g.gain.exponentialRampToValueAtTime(Math.max(0.0005, peak), when + attack);
         g.gain.exponentialRampToValueAtTime(0.0001, when + attack + decay);
-        g.connect(master);
+        g.connect(dest || master);
         return g;
+    }
+
+    /* gentle tanh soft-clip curve so the bus saturates instead of hard-clipping
+       when several layers stack */
+    function tanhCurve(k) {
+        var n = 2048;
+        var c = new Float32Array(n);
+        for (var i = 0; i < n; i++) {
+            var x = (2 * i) / (n - 1) - 1;
+            c[i] = Math.tanh(x * k) / Math.tanh(k);
+        }
+        return c;
+    }
+
+    /* stereo noise-decay impulse response for the reverb send */
+    function makeIR(seconds, decay) {
+        var len = Math.floor(ctx.sampleRate * seconds);
+        var ir = ctx.createBuffer(2, len, ctx.sampleRate);
+        for (var c = 0; c < 2; c++) {
+            var d = ir.getChannelData(c);
+            for (var i = 0; i < len; i++) {
+                d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+            }
+        }
+        return ir;
     }
 
     function envFiltered(when, peak, attack, decay, freq) {
@@ -139,79 +183,170 @@
         return o;
     }
 
-    function noiseHit(when, peak, attack, decay, filterType, freq) {
+    function noiseHit(when, peak, attack, decay, filterType, freq, q) {
         var g = env(when, peak, attack, decay);
         var src = ctx.createBufferSource();
         src.buffer = noiseBuffer();
+        src.loop = true;
         var f = ctx.createBiquadFilter();
         f.type = filterType;
         f.frequency.setValueAtTime(freq, when);
+        if (q) f.Q.value = q;
         src.connect(f);
         f.connect(g);
-        src.start(when);
+        src.start(when, Math.random() * 1.5);
         src.stop(when + attack + decay + 0.05);
     }
 
-    /* full FM engine: sine operators wired by an algorithm graph. modulators
-       feed the target oscillator's frequency (in Hz); depth scales with the
-       played note so ratios keep their sidebands across the keyboard, like
-       real FM. operators with feedback self-oscillate through a tiny delay
-       (Web Audio requires a delay node to close a cycle). */
+    /* tiny bright noise transient for kick attack */
+    function clickHit(when, peak) {
+        noiseHit(when, peak, 0.0005, 0.01, "highpass", 2600);
+    }
+
+    /* TR-808-style metallic hat: six detuned square oscillators at inharmonic
+       ratios, highpassed - far more "metal" than plain filtered noise */
+    function metalHat(when, peak, decay, hpFreq) {
+        var g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, when);
+        g.gain.exponentialRampToValueAtTime(Math.max(0.0005, peak), when + 0.001);
+        g.gain.exponentialRampToValueAtTime(0.0001, when + 0.001 + decay);
+        var f = ctx.createBiquadFilter();
+        f.type = "highpass";
+        f.frequency.setValueAtTime(hpFreq, when);
+        f.Q.value = 1.4;
+        g.connect(f);
+        f.connect(master);
+        var ratios = [2, 3, 4.16, 5.43, 6.79, 8.21];
+        for (var i = 0; i < ratios.length; i++) {
+            var o = burst(62 * ratios[i], "square", when, g);
+            o.start(when);
+            o.stop(when + decay + 0.05);
+        }
+    }
+
+    /* ---------------- FM synthesis engine ----------------
+       Sine operators wired by an algorithm graph (DX7-style). A patch is
+       parsed and defaulted up front so building the graph can never throw
+       half-finished or stall the transport scheduler. Modulation depth
+       scales with the target operator's own frequency, so a ratio keeps its
+       sidebands across the keyboard like real FM, and operators with
+       feedback self-oscillate through a tiny delay (Web Audio requires a
+       delay node to close a cycle). Voices are torn down strictly against
+       the audio clock, so a note always finishes its release. */
+    function fmOp(raw) {
+        function num(v, d, lo, hi) {
+            var x = Number(v);
+            if (isNaN(x)) x = d;
+            return Math.max(lo, Math.min(hi, x));
+        }
+        return {
+            ratio: num(raw.ratio, 1, 0.25, 32),
+            level: num(raw.level == null ? 1 : raw.level, 1, 0, 1),
+            feedback: num(raw.feedback, 0, 0, 0.9),
+            attack: num(raw.attack, 0.002, 0.001, 20),
+            decay: num(raw.decay, 0.3, 0.001, 20),
+            sustain: num(raw.sustain, 0, 0, 1),
+            release: num(raw.release, 0.15, 0.005, 20)
+        };
+    }
     function fmHit(patch, freq, when, vel, gate) {
-        var ops = patch.operators || [];
-        var oscs = [];
-        var maxEnd = 0;
-        function opEnv(o, peak) {
-            var g = ctx.createGain();
-            g.gain.setValueAtTime(0.0001, when);
-            g.gain.exponentialRampToValueAtTime(Math.max(0.0005, peak), when + o.attack);
-            var sus = Math.max(0.0005, peak * Math.max(0.02, o.sustain));
-            g.gain.exponentialRampToValueAtTime(sus, when + o.attack + o.decay);
-            var off = gate == null ? when + o.attack + o.decay
-                                   : Math.max(when + o.attack + o.decay, when + gate);
-            g.gain.setValueAtTime(sus, off);
-            g.gain.exponentialRampToValueAtTime(0.0001, off + o.release);
-            maxEnd = Math.max(maxEnd, off - when + o.release + 0.03);
-            return g;
+        var raw = (patch && patch.operators) || [];
+        var out = (patch && patch.output) || [];
+        var n = Math.min(raw.length, 6);
+        if (!n || !out.length) return;
+        vel = clamp01(vel == null ? 1 : vel);
+
+        /* pass 1 - validate: every index and envelope time is parsed and
+           defaulted before a single audio node exists, so pass 2 cannot
+           throw mid-build or poison the transport with an exception */
+        var isCarrier = [], targets = [], pars = [], links = [], i, k;
+        for (i = 0; i < n; i++) { isCarrier.push(false); targets.push(-1); pars.push(fmOp(raw[i] || {})); }
+        for (i = 0; i < out.length; i++) {
+            k = Math.round(Number(out[i]));
+            if (k >= 0 && k < n) isCarrier[k] = true;
         }
-        var envs = [];
-        for (var i = 0; i < ops.length; i++) {
-            var o = ops[i];
-            var osc = ctx.createOscillator();
-            osc.type = "sine";
-            osc.frequency.setValueAtTime(Math.max(1, freq * o.ratio), when);
-            if (o.feedback > 0) {
-                var fb = ctx.createGain();
-                fb.gain.value = o.feedback * freq * 0.5;
-                var dl = ctx.createDelay(0.05);
-                dl.delayTime.value = 0.001;
-                osc.connect(fb);
-                fb.connect(dl);
-                dl.connect(osc.frequency);
-            }
-            var isCarrier = patch.output.indexOf(i) !== -1;
-            var peak = isCarrier ? o.level * vel * 0.5 : o.level * vel * freq * 0.5;
-            var g = opEnv(o, peak);
-            osc.connect(g);
-            osc.start(when);
-            osc.stop(when + 5);
-            oscs.push(osc);
-            envs.push(g);
-        }
-        Object.keys(patch.algorithm || {}).forEach(function (src) {
-            var targets = patch.algorithm[src];
-            if (!Array.isArray(targets)) targets = [targets];
-            targets.forEach(function (dst) {
-                envs[src].connect(oscs[dst].frequency);
+        var algo = patch.algorithm || {};
+        Object.keys(algo).forEach(function (s) {
+            var src = Math.round(Number(s));
+            if (!(src >= 0 && src < n)) return;
+            var dsts = Array.isArray(algo[s]) ? algo[s] : [algo[s]];
+            dsts.forEach(function (d) {
+                var dst = Math.round(Number(d));
+                if (!(dst >= 0 && dst < n) || dst === src) return;
+                links.push([src, dst]);
+                if (targets[src] < 0) targets[src] = dst;
             });
         });
-        patch.output.forEach(function (dst) {
-            envs[dst].connect(master);
-        });
-        setTimeout(function () {
-            oscs.forEach(function (o) { try { o.disconnect(); } catch (e) {} });
-            envs.forEach(function (g) { try { g.disconnect(); } catch (e) {} });
-        }, (maxEnd + 0.2) * 1000);
+        var live = false;
+        for (i = 0; i < n; i++) if (isCarrier[i] || targets[i] >= 0) live = true;
+        if (!live) return;
+
+        /* pass 2 - build. carrier envelopes hold amplitude; modulator
+           envelopes hold depth in Hz, scaled by the TARGET operator's own
+           frequency so the sidebands track the played note */
+        var oscs = [], envs = [], aux = [], endAt = when;
+        for (i = 0; i < n; i++) {
+            oscs.push(null);
+            envs.push(null);
+            if (!isCarrier[i] && targets[i] < 0) continue;
+            var p = pars[i];
+            var f = Math.max(1, freq * p.ratio);
+            var peak = isCarrier[i] ? p.level * vel * 0.5
+                                    : p.level * vel * Math.max(1, freq * pars[targets[i]].ratio);
+            peak = Math.max(0.0005, peak);
+            var off = gate == null ? when + p.attack + p.decay
+                                   : Math.max(when + p.attack + p.decay, when + gate);
+            var end = gate == null ? when + p.attack + p.decay : off + p.release;
+            var g = ctx.createGain();
+            g.gain.setValueAtTime(0.0001, when);
+            g.gain.exponentialRampToValueAtTime(peak, when + p.attack);
+            if (gate != null) {
+                var sus = Math.max(0.0005, peak * Math.max(0.0001, p.sustain));
+                g.gain.exponentialRampToValueAtTime(sus, when + p.attack + p.decay);
+                if (off > when + p.attack + p.decay) g.gain.setValueAtTime(sus, off);
+                g.gain.exponentialRampToValueAtTime(0.0001, end);
+            } else {
+                g.gain.exponentialRampToValueAtTime(0.0001, end);
+            }
+            var osc = ctx.createOscillator();
+            osc.type = "sine";
+            osc.frequency.setValueAtTime(f, when);
+            osc.connect(g);
+            if (p.feedback > 0) {
+                var fbg = ctx.createGain();
+                fbg.gain.value = p.feedback * f * 0.25;
+                var dl = ctx.createDelay(0.05);
+                dl.delayTime.value = Math.min(0.01, 4 / ctx.sampleRate);
+                osc.connect(fbg);
+                fbg.connect(dl);
+                dl.connect(osc.frequency);
+                aux.push(fbg);
+                aux.push(dl);
+            }
+            osc.start(when);
+            osc.stop(end + 0.02);
+            if (isCarrier[i]) g.connect(master);
+            oscs[i] = osc;
+            envs[i] = g;
+            if (end > endAt) endAt = end;
+        }
+
+        /* wire the algorithm: modulator envelope out -> target frequency */
+        for (i = 0; i < links.length; i++) {
+            var srcEnv = envs[links[i][0]];
+            var dstOsc = oscs[links[i][1]];
+            if (srcEnv && dstOsc) srcEnv.connect(dstOsc.frequency);
+        }
+
+        /* teardown measured from the AUDIO clock (the old one timed from
+           wall-clock "now" while the note could still be lookahead-future,
+           disconnecting still-releasing voices = abrupt cutoff) */
+        (function (nodes) {
+            var ms = Math.max(300, (endAt - ctx.currentTime + 0.25) * 1000);
+            setTimeout(function () {
+                nodes.forEach(function (x) { try { x.disconnect(); } catch (e) {} });
+            }, ms);
+        })(oscs.concat(envs, aux).filter(Boolean));
     }
 
     /* DX7 E.Piano-1-flavoured preset for the built-in 'fm' instrument */
@@ -225,6 +360,217 @@
         algorithm: { 0: [2], 1: [2], 2: [3] },
         output: [3]
     };
+
+    /* classic DX7 "warm pad"-flavoured preset: slow swelling attack, two gentle
+       modulators on a sine carrier - smooth and glassy instead of buzzy */
+    var FM_PAD = {
+        operators: [
+            { ratio: 1.0, level: 0.28, attack: 0.55, decay: 1.3, sustain: 0.55, release: 0.7 },
+            { ratio: 2.0, level: 0.09, attack: 0.9, decay: 1.6, sustain: 0.3, release: 0.9 },
+            { ratio: 1.0, level: 1.0, attack: 0.45, decay: 1.4, sustain: 0.85, release: 0.6 }
+        ],
+        algorithm: { 0: [2], 1: [2] },
+        output: [2]
+    };
+
+    /* waveform cache: DFT-generated PeriodicWaves (phase distortion,
+       wavetable, chip duty) share this; keys are quantised so every distinct
+       wave is built at most once per session. */
+    var waveCache = new Map();
+    function dftWave(key, fn) {
+        var w = waveCache.get(key);
+        if (w) return w;
+        var N = 512, H = 48;
+        var s = new Float32Array(N);
+        for (var i = 0; i < N; i++) s[i] = fn(i / N);
+        var re = new Float32Array(H), im = new Float32Array(H);
+        for (var k = 1; k < H; k++) {
+            var a = 0, b = 0;
+            for (var i = 0; i < N; i++) {
+                var ph = 2 * Math.PI * k * i / N;
+                a += s[i] * Math.cos(ph);
+                b += s[i] * Math.sin(ph);
+            }
+            re[k] = 2 * a / N;
+            im[k] = -2 * b / N;
+        }
+        w = ctx.createPeriodicWave(re, im);
+        waveCache.set(key, w);
+        return w;
+    }
+    function n01(v, d, lo, hi) { v = Number(v); if (isNaN(v)) v = d; return Math.max(lo, Math.min(hi, v)); }
+
+    /* phase distortion (Casio CZ flavour): the ramp's phase is warped around
+       its wrap point - shape 0.05 saw-bright, 0.5 hollow triangle, 0.95
+       reversed saw. two cached waves crossfade over pd.decay for the classic
+       brightness settle. */
+    function pdWave(s) {
+        return dftWave("pd" + Math.round(s * 40), function (p) {
+            var q = p < s ? p * (0.5 / s) : 0.5 + (p - s) * (0.5 / (1 - s));
+            return 2 * q - 1;
+        });
+    }
+    function pdVoice(pd, freq, when, stopAt, bus) {
+        var sA = n01(pd.shape, 0.12, 0.02, 0.98);
+        var sB = n01(pd.shape_end, 0.5, 0.02, 0.98);
+        var ct = n01(pd.decay, 0.25, 0.01, 4);
+        var oA = ctx.createOscillator();
+        oA.setPeriodicWave(pdWave(sA));
+        oA.frequency.setValueAtTime(freq, when);
+        var gA = ctx.createGain();
+        gA.gain.setValueAtTime(1, when);
+        oA.connect(gA);
+        gA.connect(bus);
+        oA.start(when);
+        oA.stop(when + stopAt + 0.02);
+        if (Math.abs(sA - sB) > 0.001) {
+            gA.gain.linearRampToValueAtTime(0, when + ct);
+            var oB = ctx.createOscillator();
+            oB.setPeriodicWave(pdWave(sB));
+            oB.frequency.setValueAtTime(freq, when);
+            var gB = ctx.createGain();
+            gB.gain.setValueAtTime(0, when);
+            gB.gain.linearRampToValueAtTime(1, when + ct);
+            oB.connect(gB);
+            gB.connect(bus);
+            oB.start(when);
+            oB.stop(when + stopAt + 0.02);
+        }
+    }
+
+    /* wavetable: procedurally generated additive tables (harmonics = saw
+       forming, even = reedy, sparse = prime partials, bellish) swept by
+       crossfading cached waves at position steps */
+    var WT_PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47];
+    function wtWave(table, p) {
+        var lim = 2 + p * 45;
+        return dftWave("wt" + table + Math.round(p * 40), function (t) {
+            var v = 0;
+            for (var k = 1; k < 48 && k <= lim; k++) {
+                var a = 0;
+                if (table === "even") { if (k % 2 === 0) a = 1 / k; }
+                else if (table === "sparse") { if (WT_PRIMES.indexOf(k) !== -1) a = 1 / Math.sqrt(k); }
+                else a = Math.pow(1 / k, 0.75);
+                if (a) v += a * Math.sin(2 * Math.PI * k * t);
+            }
+            return v;
+        });
+    }
+    function wtVoice(wt, freq, when, stopAt, bus) {
+        var table = String(wt.table || "harmonics");
+        var p0 = n01(wt.pos_start, 0.05, 0, 1);
+        var p1 = n01(wt.pos_end, 0.9, 0, 1);
+        var steps = Math.round(n01(wt.steps, 8, 1, 24));
+        if (p1 === p0) steps = 1;
+        var sweep = n01(wt.pos_time, 0.4, 0.01, 4);
+        var dt = sweep / steps;
+        var fade = Math.min(0.04, dt * 0.8);
+        for (var i = 0; i < steps; i++) {
+            var p = steps === 1 ? p1 : p0 + (p1 - p0) * i / (steps - 1);
+            var t0 = when + i * dt;
+            var o = ctx.createOscillator();
+            o.setPeriodicWave(wtWave(table, p));
+            o.frequency.setValueAtTime(freq, when);
+            var g = ctx.createGain();
+            if (i === 0) g.gain.setValueAtTime(1, when);
+            else { g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(1, t0 + fade); }
+            if (i < steps - 1) {
+                g.gain.setValueAtTime(1, t0 + dt);
+                g.gain.linearRampToValueAtTime(0, t0 + dt + fade);
+                o.stop(t0 + dt + fade + 0.02);
+            } else {
+                o.stop(when + stopAt + 0.02);
+            }
+            o.connect(g);
+            g.connect(bus);
+            o.start(t0);
+        }
+    }
+
+    /* chip (NES 2A03 flavour): pulse wave at a set duty, optional duty sweep
+       and authentic rate-stepped arpeggio */
+    function chipWave(d) {
+        return dftWave("chip" + Math.round(d * 40), function (p) { return p < d ? 1 : -1; });
+    }
+    function chipVoice(chip, freq, when, stopAt, bus) {
+        var dA = n01(chip.duty, 0.5, 0.03, 0.5);
+        var dB = chip.duty_end == null ? dA : n01(chip.duty_end, dA, 0.03, 0.5);
+        var oscs = [ctx.createOscillator()];
+        oscs[0].setPeriodicWave(chipWave(dA));
+        oscs[0].frequency.setValueAtTime(freq, when);
+        var gA = ctx.createGain();
+        gA.gain.setValueAtTime(1, when);
+        oscs[0].connect(gA);
+        gA.connect(bus);
+        oscs[0].start(when);
+        oscs[0].stop(when + stopAt + 0.02);
+        if (Math.abs(dA - dB) > 0.001) {
+            var sw = n01(chip.duty_time, 0.15, 0.01, 4);
+            gA.gain.linearRampToValueAtTime(0, when + sw);
+            var oB = ctx.createOscillator();
+            oB.setPeriodicWave(chipWave(dB));
+            oB.frequency.setValueAtTime(freq, when);
+            var gB = ctx.createGain();
+            gB.gain.setValueAtTime(0, when);
+            gB.gain.linearRampToValueAtTime(1, when + sw);
+            oB.connect(gB);
+            gB.connect(bus);
+            oscs.push(oB);
+            oB.start(when);
+            oB.stop(when + stopAt + 0.02);
+        }
+        var arp = (Array.isArray(chip.arp) ? chip.arp : []).map(Number).filter(function (x) { return !isNaN(x); }).slice(0, 8);
+        if (arp.length) {
+            var rate = n01(chip.arp_rate, 25, 1, 100);
+            var step = 1 / rate;
+            var n = Math.min(400, Math.ceil(stopAt / step));
+            for (var i = 0; i < n; i++) {
+                var f = Math.max(20, freq * Math.pow(2, arp[i % arp.length] / 12));
+                for (var j = 0; j < oscs.length; j++) oscs[j].frequency.setValueAtTime(f, when + i * step);
+            }
+        }
+    }
+
+    /* granular: pitch-locked swarm of tiny windowed grains. the source is one
+       sine cycle (looped, playbackRate = f/f0 per note) or noise for shimmer
+       clouds. grain count caps at 400 per note for safety. */
+    var grainSrc = null;
+    function grainSource() {
+        if (grainSrc) return grainSrc;
+        var len = Math.max(8, Math.round(ctx.sampleRate / 110));
+        grainSrc = ctx.createBuffer(1, len, ctx.sampleRate);
+        var d = grainSrc.getChannelData(0);
+        for (var i = 0; i < len; i++) d[i] = Math.sin(2 * Math.PI * i / len);
+        return grainSrc;
+    }
+    function grainVoice(gr, freq, when, vel, dur, bus) {
+        var gs = n01(gr.size, 0.08, 0.01, 1);
+        var rate = n01(gr.rate, 14, 1, 80);
+        var scatter = n01(gr.scatter, 0.015, 0, 0.2);
+        var noise = String(gr.src) === "noise";
+        var buf = noise ? noiseBuffer() : grainSource();
+        var d = Math.max(0.1, dur == null ? 0.6 : dur);
+        var n = Math.max(1, Math.min(400, Math.round(d * rate)));
+        var gap = d / n;
+        var amp = vel * 0.7 / Math.sqrt(Math.max(4, n));
+        for (var i = 0; i < n; i++) {
+            var t = when + i * gap + Math.random() * gap * 0.5;
+            var src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.loop = true;
+            src.playbackRate.value = noise
+                ? Math.max(0.05, 1 + scatter * (Math.random() * 2 - 1))
+                : Math.max(0.05, (freq / 110) * (1 + scatter * (Math.random() * 2 - 1)));
+            var g = ctx.createGain();
+            g.gain.setValueAtTime(0.0001, t);
+            g.gain.linearRampToValueAtTime(amp, t + gs * 0.5);
+            g.gain.linearRampToValueAtTime(0.0001, t + gs);
+            src.connect(g);
+            g.connect(bus);
+            src.start(t, Math.random() * buf.duration * 0.9);
+            src.stop(t + gs + 0.02);
+        }
+    }
 
     function customHit(def, freq, when, vel, gate) {
         if (def.fm) fmHit(def.fm, freq, when, vel, gate);
@@ -252,7 +598,17 @@
             stopAt = off - when + release + 0.02;
         }
 
-        var bus = amp;
+        /* ring modulator sits between the voice bus and the amp: its gain
+           param is driven purely by the modulator osc (base 0), so the
+           output is signal x sine - metallic sum/difference sidebands */
+        var sink = amp;
+        if (def.ring) {
+            var ringG = ctx.createGain();
+            ringG.gain.value = 0;
+            ringG.connect(amp);
+            sink = ringG;
+        }
+        var bus = sink;
         if (def.filter) {
             var fl = def.filter;
             var f = ctx.createBiquadFilter();
@@ -265,11 +621,18 @@
             } else {
                 f.frequency.setValueAtTime(cutoff, when);
             }
-            f.connect(amp);
+            f.connect(sink);
             bus = f;
         }
 
+        if (def.pd) pdVoice(def.pd, freq, when, stopAt, bus);
+        if (def.wt) wtVoice(def.wt, freq, when, stopAt, bus);
+        if (def.chip) chipVoice(def.chip, freq, when, stopAt, bus);
+        if (def.grain) grainVoice(def.grain, freq, when, vel, gate, bus);
         var layers = def.osc || [];
+        if (!layers.length && def.ring && !def.fm && !def.pd && !def.wt && !def.chip && !def.grain) {
+            layers = [{ type: "sine", level: 1 }];
+        }
         for (var i = 0; i < layers.length; i++) {
             var o = layers[i];
             if (!o || !(o.level > 0)) continue;
@@ -293,6 +656,7 @@
         if (def.noise && def.noise.level > 0) {
             var src = ctx.createBufferSource();
             src.buffer = noiseBuffer();
+            src.loop = true;
             var nf = ctx.createBiquadFilter();
             nf.type = def.noise.filter || "lowpass";
             nf.frequency.setValueAtTime(def.noise.freq || 2000, when);
@@ -301,8 +665,18 @@
             src.connect(nf);
             nf.connect(ng);
             ng.connect(bus);
-            src.start(when);
+            src.start(when, Math.random() * 1.5);
             src.stop(when + stopAt);
+        }
+        if (def.ring) {
+            var rf = Number(def.ring.freq);
+            if (!(rf >= 20)) rf = Math.max(1, freq * n01(def.ring.ratio, 1.5, 0.05, 32));
+            var rmo = ctx.createOscillator();
+            rmo.type = "sine";
+            rmo.frequency.setValueAtTime(rf, when);
+            rmo.connect(sink);
+            rmo.start(when);
+            rmo.stop(when + stopAt + 0.02);
         }
     }
 
@@ -315,51 +689,64 @@
         var o;
         switch (name) {
             case "kick": {
-                var g = env(when, vel * 0.95, 0.004, 0.34);
-                o = burst(160, "sine", when, g);
-                o.frequency.exponentialRampToValueAtTime(42, when + 0.11);
-                o.start(when); o.stop(when + 0.4);
+                clickHit(when, vel * 0.4);
+                var g = env(when, vel * 0.9, 0.003, 0.4);
+                o = burst(170, "sine", when, g);
+                o.frequency.exponentialRampToValueAtTime(45, when + 0.09);
+                o.frequency.exponentialRampToValueAtTime(38, when + 0.4);
+                o.start(when); o.stop(when + 0.45);
                 break;
             }
             case "snare": {
-                noiseHit(when, vel * 0.55, 0.002, 0.16, "highpass", 1500);
-                var g2 = env(when, vel * 0.45, 0.002, 0.09);
+                noiseHit(when, vel * 0.5, 0.002, 0.18, "highpass", 1800);
+                noiseHit(when, vel * 0.3, 0.001, 0.05, "bandpass", 3400, 0.9);
+                var g2 = env(when, vel * 0.42, 0.002, 0.09);
                 o = burst(190, "triangle", when, g2);
+                o.frequency.exponentialRampToValueAtTime(165, when + 0.09);
                 o.start(when); o.stop(when + 0.12);
+                var g3 = env(when, vel * 0.16, 0.002, 0.06);
+                var o3 = burst(335, "triangle", when, g3);
+                o3.start(when); o3.stop(when + 0.09);
                 break;
             }
             case "clap": {
-                noiseHit(when, vel * 0.3, 0.001, 0.02, "bandpass", 1200);
-                noiseHit(when + 0.012, vel * 0.3, 0.001, 0.02, "bandpass", 1200);
-                noiseHit(when + 0.024, vel * 0.4, 0.001, 0.03, "bandpass", 1200);
-                noiseHit(when + 0.036, vel * 0.5, 0.002, 0.14, "bandpass", 1400);
+                noiseHit(when, vel * 0.28, 0.001, 0.02, "bandpass", 1100, 1.2);
+                noiseHit(when + 0.011, vel * 0.28, 0.001, 0.02, "bandpass", 1150, 1.2);
+                noiseHit(when + 0.022, vel * 0.36, 0.001, 0.025, "bandpass", 1200, 1.2);
+                noiseHit(when + 0.034, vel * 0.45, 0.002, 0.16, "bandpass", 1250, 1.5);
                 break;
             }
             case "hihat_closed":
-                noiseHit(when, vel * 0.32, 0.001, 0.045, "highpass", 7500);
+                metalHat(when, vel * 0.28, 0.055, 9000);
                 break;
             case "hihat_open":
-                noiseHit(when, vel * 0.28, 0.001, 0.32, "highpass", 7000);
+                metalHat(when, vel * 0.24, 0.42, 8000);
                 break;
             case "tom": {
-                var gt = env(when, vel * 0.75, 0.004, 0.26);
-                o = burst(220, "sine", when, gt);
-                o.frequency.exponentialRampToValueAtTime(95, when + 0.2);
-                o.start(when); o.stop(when + 0.3);
+                noiseHit(when, vel * 0.1, 0.002, 0.02, "lowpass", 900);
+                var gt = env(when, vel * 0.7, 0.003, 0.3);
+                o = burst(210, "sine", when, gt);
+                o.frequency.exponentialRampToValueAtTime(92, when + 0.22);
+                o.start(when); o.stop(when + 0.35);
+                var go = env(when, vel * 0.12, 0.003, 0.16);
+                var o2 = burst(420, "sine", when, go);
+                o2.frequency.exponentialRampToValueAtTime(185, when + 0.14);
+                o2.start(when); o2.stop(when + 0.22);
                 break;
             }
             case "rim": {
-                var gr = envFiltered(when, vel * 0.5, 0.001, 0.035, 1700);
+                var gr = envFiltered(when, vel * 0.5, 0.001, 0.03, 1700);
                 o = burst(1700, "square", when, gr);
-                o.start(when); o.stop(when + 0.06);
+                o.start(when); o.stop(when + 0.05);
+                noiseHit(when, vel * 0.12, 0.001, 0.015, "highpass", 2200);
                 break;
             }
             case "cowbell": {
-                var gc = envFiltered(when, vel * 0.35, 0.001, 0.14, 2600);
+                var gc = envFiltered(when, vel * 0.35, 0.001, 0.3, 2600);
                 var a = burst(540, "square", when, gc);
                 var b = burst(800, "square", when, gc);
-                a.start(when); a.stop(when + 0.18);
-                b.start(when); b.stop(when + 0.18);
+                a.start(when); a.stop(when + 0.35);
+                b.start(when); b.stop(when + 0.35);
                 break;
             }
         }
@@ -377,7 +764,7 @@
         o.stop(when + hold + 0.05);
     }
 
-    function sustainVoice(type, freq, when, dur, peak, atk, rel, cutoff) {
+    function sustainVoice(type, freq, when, dur, peak, atk, rel, cutoff, vib) {
         var hold = Math.max(0.08, dur);
         var g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, when);
@@ -394,6 +781,18 @@
             g.connect(master);
         }
         var o = burst(freq, type, when, g);
+        if (vib) {
+            var lfo = ctx.createOscillator();
+            lfo.type = "sine";
+            lfo.frequency.value = vib.rate || 5.5;
+            var lg = ctx.createGain();
+            lg.gain.setValueAtTime(0, when);
+            lg.gain.linearRampToValueAtTime(vib.depth || 10, when + (vib.delay || 0.25));
+            lfo.connect(lg);
+            lg.connect(o.detune);
+            lfo.start(when);
+            lfo.stop(when + hold + rel + 0.05);
+        }
         o.start(when);
         o.stop(when + hold + rel + 0.05);
     }
@@ -406,23 +805,31 @@
             return;
         }
         switch (kind) {
-            case "piano":
-                pluckVoice("triangle", f, when, Math.max(dur, 0.4), vel * 0.5);
-                pluckVoice("sine", f * 2, when, Math.max(dur, 0.4) * 0.5, vel * 0.16);
+            case "piano": {
+                var pd = Math.max(dur, 0.5) + vel * 0.5;
+                pluckVoice("triangle", f, when, pd, vel * 0.45);
+                pluckVoice("sine", f * 2, when, pd * 0.55, vel * 0.14);
+                pluckVoice("sine", f * 3, when, pd * 0.3, vel * 0.05);
+                noiseHit(when, vel * 0.05, 0.001, 0.025, "lowpass", 900);
                 break;
+            }
             case "pluck":
-                pluckVoice("triangle", f, when, Math.min(dur, 0.35), vel * 0.5);
+                pluckVoice("triangle", f, when, Math.min(dur, 0.35), vel * 0.42);
+                pluckVoice("triangle", f * 1.003, when, Math.min(dur, 0.28), vel * 0.18);
+                pluckVoice("sine", f * 2, when, Math.min(dur, 0.12), vel * 0.12);
                 break;
             case "bass":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.5, 0.01, 0.08, Math.min(f * 4, 1100));
+                sustainVoice("sawtooth", f, when, dur, vel * 0.45, 0.008, 0.08, Math.min(f * 3.5, 950));
+                sustainVoice("sine", Math.max(30, f * 0.5), when, dur, vel * 0.25, 0.015, 0.08, 0);
                 break;
             case "lead":
-                sustainVoice("square", f, when, dur, vel * 0.26, 0.01, 0.06, 3200);
-                sustainVoice("sawtooth", f * 1.005, when, dur, vel * 0.1, 0.01, 0.06, 3200);
+                sustainVoice("square", f, when, dur, vel * 0.24, 0.01, 0.06, 3200, { rate: 5.8, depth: 8, delay: 0.25 });
+                sustainVoice("sawtooth", f * 1.005, when, dur, vel * 0.1, 0.01, 0.06, 3200, { rate: 5.8, depth: 8, delay: 0.25 });
                 break;
             case "pad":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.16, Math.min(dur * 0.4, 0.35), 0.3, 1600);
-                sustainVoice("sawtooth", f * 1.007, when, dur, vel * 0.12, Math.min(dur * 0.4, 0.35), 0.3, 1600);
+                fmHit(FM_PAD, f * 1.003, when, vel * 0.55, dur);
+                fmHit(FM_PAD, f * 0.997, when, vel * 0.55, dur);
+                sustainVoice("sine", f, when, dur, vel * 0.06, Math.min(dur * 0.5, 0.5), 0.4, 0, { rate: 4.4, depth: 5, delay: 0.6 });
                 break;
             case "bells":
                 pluckVoice("sine", f, when, Math.max(dur, 1.2), vel * 0.4);
@@ -448,17 +855,17 @@
                 sustainVoice("sine", f * 4, when, dur, vel * 0.05, 0.02, 0.15, 0);
                 break;
             case "strings":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.18, 0.09, 0.35, Math.min(f * 3, 3000));
-                sustainVoice("sawtooth", f * 1.008, when, dur, vel * 0.16, 0.1, 0.35, Math.min(f * 3, 3000));
-                sustainVoice("sawtooth", f * 0.995, when, dur, vel * 0.13, 0.11, 0.35, Math.min(f * 3, 3000));
+                sustainVoice("sawtooth", f, when, dur, vel * 0.17, 0.09, 0.35, Math.min(f * 3, 3000), { rate: 5.2, depth: 7, delay: 0.4 });
+                sustainVoice("sawtooth", f * 1.008, when, dur, vel * 0.15, 0.1, 0.35, Math.min(f * 3, 3000), { rate: 5.5, depth: 7, delay: 0.5 });
+                sustainVoice("sawtooth", f * 0.995, when, dur, vel * 0.12, 0.11, 0.35, Math.min(f * 3, 3000), { rate: 4.9, depth: 7, delay: 0.45 });
                 break;
             case "synbrass":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.24, 0.03, 0.12, Math.min(f * 8, 4500));
-                sustainVoice("square", f * 1.006, when, dur, vel * 0.11, 0.03, 0.12, Math.min(f * 6, 3500));
+                sustainVoice("sawtooth", f, when, dur, vel * 0.22, 0.03, 0.12, Math.min(f * 8, 4500), { rate: 5, depth: 5, delay: 0.4 });
+                sustainVoice("square", f * 1.006, when, dur, vel * 0.1, 0.03, 0.12, Math.min(f * 6, 3500), { rate: 5, depth: 5, delay: 0.4 });
                 break;
             case "flute":
-                sustainVoice("sine", f, when, dur, vel * 0.32, 0.06, 0.15, 0);
-                sustainVoice("sine", f * 2, when, dur, vel * 0.05, 0.08, 0.15, 0);
+                sustainVoice("sine", f, when, dur, vel * 0.3, 0.06, 0.15, 0, { rate: 5.2, depth: 14, delay: 0.3 });
+                sustainVoice("sine", f * 2, when, dur, vel * 0.05, 0.08, 0.15, 0, { rate: 5.2, depth: 14, delay: 0.35 });
                 noiseHit(when, vel * 0.03, 0.06, Math.max(dur, 0.2), "bandpass", f * 1.4);
                 break;
             case "musicbox":
@@ -664,7 +1071,9 @@
             // occurrences so the loop resumes exactly on its own phase
             while (loop.nextStep < nowStep) loop.nextStep += span;
             while (loop.nextStep < horizonStep) {
-                scheduleOccurrence(loop, loop.nextStep);
+                /* one bad definition must not stall every other loop */
+                try { scheduleOccurrence(loop, loop.nextStep); }
+                catch (e) { loop.playing = false; }
                 loop.nextStep += span;
             }
         });
