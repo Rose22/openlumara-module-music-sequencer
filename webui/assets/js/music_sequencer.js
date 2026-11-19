@@ -1,13 +1,22 @@
 (function () {
     var MAX_LAYERS = 60;
-    /* bar width for loop-start quantization; each loop keeps its own authored
-       steps_per_bar for its repeating span, so mixed-meter layers coexist */
+    /* global grid: meter steps per bar on the 16th-note transport. loops
+       author their own resolution (def.steps_per_bar cells per bar, e.g. 12
+       for triplets) and map them onto meter-long bars, so feel varies while
+       every layer still shares one bar grid */
     var stepsPerBar = 16;
+    var song = null;
     var LOOKAHEAD = 0.15;
     var TICK_MS = 25;
 
     var ctx = null;
     var master = null;
+    /* fixed chain nodes the master bus hangs on; kept module-level so panic()
+       can re-hang a fresh master mid-session */
+    var fxIn = null;
+    var verbSend = null;
+    var verbNode = null;
+    var compNode = null;
     var noiseBuf = null;
     var bpm = 120;
     var anchored = false;
@@ -44,7 +53,7 @@
         var bestTarget = -1;
         loops.forEach(function (l) {
             if (!l.playing || !l.def || l.nextStep < 0) return;
-            var span = (l.def.bar_length || 1) * (l.def.steps_per_bar || 16);
+            var span = (l.def.bar_length || 1) * stepsPerBar;
             var t = l.nextStep;
             while (t < nowStep) t += span;
             if (span > bestSpan || (span === bestSpan && t < bestTarget)) { bestSpan = span; bestTarget = t; }
@@ -93,6 +102,8 @@
                 master.connect(shaper);
                 shaper.connect(comp);
                 comp.connect(ctx.destination);
+                fxIn = shaper;
+                compNode = comp;
                 try {
                     var verb = ctx.createConvolver();
                     verb.buffer = makeIR(1.6, 3.2);
@@ -105,6 +116,8 @@
                     vhp.connect(send);
                     send.connect(verb);
                     verb.connect(comp);
+                    verbNode = verb;
+                    verbSend = vhp;
                 } catch (e) {}
                 ctx.onstatechange = onRunning;
             } catch (e) { return; }
@@ -800,24 +813,28 @@
     }
 
         /* lush analog-style pad: three detuned saws + sub-octave sine through a
-       slow lowpass swell, one shared vibrato LFO that fades in, and a quiet
-       FM_PAD layer on top for glassy shimmer. Attack scales with note length
-       so even short notes swell audibly. */
+       lowpass swell, one shared vibrato LFO that fades in, and a quiet
+       FM_PAD layer on top for glassy shimmer. The amp swell is fast and
+       two-stage (near-immediate body, gentle push to full level) so pads land
+       on the beat; the filter still opens over 0.3s for the classic bloom. */
     function padVoice(freq, when, dur, vel) {
         var hold = Math.max(0.15, dur);
-        var atk = Math.min(0.45, Math.max(0.10, dur * 0.3));
+        var atk = Math.min(0.05, Math.max(0.008, dur * 0.04));
         var rel = 0.7;
         var peak = Math.max(0.0005, vel * 0.5);
         var amp = ctx.createGain();
         amp.gain.setValueAtTime(0.0001, when);
-        amp.gain.exponentialRampToValueAtTime(peak, when + atk);
+        amp.gain.exponentialRampToValueAtTime(peak * 0.85, when + atk);
+        /* after the fast initial swell, ease into full level over a shorter,
+           capped tail - keeps the pad character without drifting off-beat */
+        amp.gain.exponentialRampToValueAtTime(peak, when + atk + Math.min(0.25, Math.max(0.06, dur * 0.1)));
         amp.gain.setValueAtTime(peak, when + Math.max(atk + 0.01, hold));
         amp.gain.exponentialRampToValueAtTime(0.0001, when + Math.max(atk + 0.01, hold) + rel);
         var f = ctx.createBiquadFilter();
         f.type = "lowpass";
         f.Q.value = 0.7;
         f.frequency.setValueAtTime(Math.min(500, Math.max(120, freq * 1.4)), when);
-        f.frequency.exponentialRampToValueAtTime(Math.min(2800, Math.max(600, freq * 4)), when + atk * 1.5);
+        f.frequency.exponentialRampToValueAtTime(Math.min(2800, Math.max(600, freq * 4)), when + 0.3);
         amp.connect(f);
         f.connect(master);
         var lfo = ctx.createOscillator();
@@ -1127,15 +1144,30 @@
     }
     requestAnimationFrame(pumpViz);
 
-    function scheduleOccurrence(loop, startStep) {
+    /* one occurrence spans bar_length meter bars; authored cells map onto it
+       at (stepsPerBar / authored) global steps per cell, so a 12-cell triplet
+       loop fills the same 4/4 bar as a 16-cell straight one. commits are
+       windowed [from, to) in global steps relative to the occurrence start,
+       so a slice of an occurrence can be scheduled without committing the
+       whole thing (song gating relies on this to stop layers near-exactly).
+       past window times are fine: hits whose instant already passed fire
+       immediately, later ones keep their exact absolute offset. */
+    function scheduleOccurrence(loop, from, to) {
         var d = loop.def;
         if (!d) return;
+        var ratio = stepsPerBar / (d.steps_per_bar || 16);
+        /* t0 and cell length are frozen at the occurrence start (loop.occT0 /
+           loop.occCell), so chunks committed across a tempo change still land
+           on one consistent map for that occurrence */
+        var cellSpan = ratio * loop.occCell;
+        var t0 = loop.occT0;
         if (d.kind === "drum") {
             var cue = visualCues.get(String(d.voice));
             var steps = d.steps || [];
             for (var i = 0; i < steps.length; i++) {
-                if (steps[i] > 0) {
-                    var when = stepTime(startStep + i);
+                var off = i * ratio;
+                if (steps[i] > 0 && off >= from && off < to) {
+                    var when = t0 + i * cellSpan;
                     drumHit(d.voice, when, steps[i] * loop.volume);
                     if (cue) vizQueue.push({ loop: loop, t: when, effect: cue, midi: null, color: colorFor(d.voice), vel: steps[i], src: d.id ? String(d.id) : null });
                 }
@@ -1146,10 +1178,67 @@
             var notes = d.notes || [];
             for (var j = 0; j < notes.length; j++) {
                 var n = notes[j];
-                var whenN = stepTime(startStep + n.start);
-                var durN = Math.max(0.05, n.length * sps());
-                noteHit(d.instrument, n.pitch, whenN, durN, n.velocity * loop.volume);
-                if (cueN) vizQueue.push({ loop: loop, t: whenN, effect: cueN, midi: n.pitch, color: noteColor, dur: durN, vel: n.velocity, src: d.id ? String(d.id) : null });
+                var offN = n.start * ratio;
+                if (offN >= from && offN < to) {
+                    var whenN = t0 + n.start * cellSpan;
+                    var durN = Math.max(0.05, n.length * cellSpan);
+                    noteHit(d.instrument, n.pitch, whenN, durN, n.velocity * loop.volume);
+                    if (cueN) vizQueue.push({ loop: loop, t: whenN, effect: cueN, midi: n.pitch, color: noteColor, dur: durN, vel: n.velocity, src: d.id ? String(d.id) : null });
+                }
+            }
+        }
+    }
+
+    /* song mode: boundaries are applied the moment the scheduler's commit
+       horizon REACHES them - the scheduler only commits LOOKAHEAD ahead, so
+       at apply time nothing past the boundary is committed yet: stopped
+       layers are capped exactly there, and new layers start their first
+       occurrence on the boundary step. (The old bug: the whole occurrence was
+       committed at once and the gate fired on wall-clock "now", so whatever
+       the lookahead held leaked across section lines by up to a loop span.) */
+    function applyBoundary(step, sec) {
+        if (!sec) {
+            /* end boundary: cap every layer, let tails ring out to the line */
+            loops.forEach(function (e, id) {
+                if (e.playing) e.stopAt = Math.min(e.stopAt == null ? Infinity : e.stopAt, step);
+            });
+            song = null;
+            return;
+        }
+        var wanted = {};
+        (sec.layers || []).forEach(function (l) { wanted[String(l.name)] = l.volume == null ? 1 : l.volume; });
+        loops.forEach(function (e, id) {
+            if (wanted[id] != null) {
+                e.volume = clamp01(wanted[id]);
+                if (!e.playing) {
+                    e.playing = true;
+                    e.nextStep = step;
+                    e.sched = -1;
+                }
+                e.stopAt = Infinity;
+            } else if (e.playing && (e.stopAt == null || e.stopAt > step)) {
+                e.stopAt = step;
+            }
+        });
+    }
+    function gateSong() {
+        if (!song || !audioReady()) return;
+        if (song.startStep < 0) {
+            song.startStep = nextBarStart();
+            song.bIdx = 0;
+            song.bStep = song.startStep;
+        }
+        var horizon = absStep(ctx.currentTime + LOOKAHEAD);
+        while (song && horizon >= song.bStep) {
+            var n = song.def.sections.length;
+            var sec = song.bIdx < n ? song.def.sections[song.bIdx] : null;
+            var step = song.bStep;
+            var bars = sec ? sec.bars : 0;
+            applyBoundary(step, sec);
+            if (song) {
+                song.bIdx = song.bIdx + 1 >= n && song.def.loop ? 0 : song.bIdx + 1;
+                if (song.bIdx >= n) song.bStep = song.startStep + (song.def.total_bars || 1) * stepsPerBar;
+                else song.bStep = step + bars * stepsPerBar;
             }
         }
     }
@@ -1158,17 +1247,45 @@
         if (!audioReady()) return;
         var nowStep = absStep(ctx.currentTime);
         var horizonStep = absStep(ctx.currentTime + LOOKAHEAD);
-        loops.forEach(function (loop) {
+        gateSong();
+        loops.forEach(function (loop, id) {
             if (!loop.playing || loop.nextStep < 0 || !loop.def) return;
-            var span = (loop.def.bar_length || 1) * (loop.def.steps_per_bar || 16);
-            // clock stalled (hidden tab, long tempo jump): fast-forward whole
-            // occurrences so the loop resumes exactly on its own phase
-            while (loop.nextStep < nowStep) loop.nextStep += span;
-            while (loop.nextStep < horizonStep) {
+            var span = (loop.def.bar_length || 1) * stepsPerBar;
+            /* (re)open an occurrence: freeze its audio-clock map so chunks
+               stay consistent even if tempo changes while it plays */
+            if (!(loop.sched >= loop.nextStep)) {
+                loop.sched = loop.nextStep;
+                loop.occT0 = stepTime(loop.nextStep);
+                loop.occCell = sps();
+            }
+            var stopAt = loop.stopAt == null ? Infinity : loop.stopAt;
+            if (stopAt <= loop.sched) {
+                vizQueue = vizQueue.filter(function (v) { return v.loop !== loop; });
+                stop(id);
+                return;
+            }
+            var occEnd = loop.nextStep + span;
+            if (occEnd <= nowStep && stopAt === Infinity) {
+                /* clock stalled (throttled tab, huge jump): drop the
+                   remainder, resume the loop exactly on its own phase */
+                while (loop.nextStep + span <= nowStep) loop.nextStep += span;
+                loop.sched = -1;
+                return;
+            }
+            /* commit only within lookahead: a stopAt capping this chunk
+               therefore falls silent at the exact boundary step */
+            var to = Math.min(horizonStep, occEnd, stopAt);
+            if (loop.sched < to) {
                 /* one bad definition must not stall every other loop */
-                try { scheduleOccurrence(loop, loop.nextStep); }
-                catch (e) { loop.playing = false; }
-                loop.nextStep += span;
+                try { scheduleOccurrence(loop, loop.sched - loop.nextStep, to - loop.nextStep); }
+                catch (e) { loop.playing = false; return; }
+                loop.sched = to;
+            }
+            if (loop.sched >= occEnd) {
+                /* occurrence fully committed: hop to the next one and let the
+                   next tick re-open it (fresh frozen clock map for its chunks) */
+                loop.nextStep = occEnd;
+                loop.sched = -1;
             }
         });
     }, TICK_MS);
@@ -1197,6 +1314,8 @@
         if (!e) return false;
         e.playing = false;
         e.nextStep = -1;
+        e.sched = -1;
+        e.stopAt = Infinity;
         vizQueue = vizQueue.filter(function (v) { return v.loop !== e; });
         if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.remove(id);
         return true;
@@ -1209,14 +1328,51 @@
         if (countPlaying() >= MAX_LAYERS) return false;
         e.playing = true;
         e.nextStep = nextSongStart();
+        e.sched = -1;
+        e.stopAt = Infinity;
         return true;
     }
 
     function stopAll() {
-        loops.forEach(function (e) { e.playing = false; e.nextStep = -1; });
+        loops.forEach(function (e) { e.playing = false; e.nextStep = -1; e.sched = -1; e.stopAt = Infinity; });
         vizQueue = [];
         if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.clear();
     }
+
+    /* hard cut for chat switches: already-scheduled notes (long pads can ring
+       for seconds) keep playing after stopAll, so swap the master bus instead
+       - the old one and everything feeding it falls silent instantly, and a
+       fresh master hangs on the same chain for what plays next. the reverb
+       tail is cut too, then the send re-hangs a frame later. */
+    function panicAudio() {
+        stopAll();
+        if (!ctx || !master || !fxIn) return;
+        try { master.disconnect(); } catch (e) {}
+        if (verbNode) { try { verbNode.disconnect(); } catch (e) {} }
+        var gen = ++localSeq;
+        master = ctx.createGain();
+        master.gain.value = masterVolume / 100;
+        try {
+            master.connect(fxIn);
+            if (verbSend) master.connect(verbSend);
+        } catch (e) {}
+        if (verbNode && compNode) {
+            setTimeout(function () {
+                if (gen !== localSeq) return;
+                try { verbNode.connect(compNode); } catch (e) {}
+            }, 60);
+        }
+    }
+    /* leaving the tab must not leave a full generative set running unseen:
+       panic and reload this chat's state so returning picks the loops back
+       up at the bar (the backend never learns anything stopped) */
+    document.addEventListener("visibilitychange", function () {
+        if (document.visibilityState === "hidden") {
+            if (audioReady() && countPlaying()) loadChat(selectedChat());
+        } else if (selectedChat()) {
+            loadChat(selectedChat());
+        }
+    });
 
     function setTempo(newBpm) {
         var v = Number(newBpm);
@@ -1261,6 +1417,7 @@
             if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.remove(id);
         },
         stopAll: stopAll,
+        panic: function () { song = null; panicAudio(); },
         testVisual: function (effect) { fireViz(String(effect || "flash"), null, null, 0.65, 1); },
         shaderDiag: function () {
             return window.MusicSequencerShaderFx
@@ -1348,6 +1505,10 @@
 
     function loadChat(chatId) {
         curChat = chatId;
+        /* hard cut the old chat: kill scheduled notes too, not just future
+           gating, so a long pad from chat A can't ring over chat B */
+        song = null;
+        panicAudio();
         loops.clear();
         sounds.clear();
         vizQueue = [];
@@ -1379,6 +1540,8 @@
                         nextStep: -1
                     });
                 });
+                /* a song that was playing resumes its arrangement from the top */
+                if (d.song && d.song.playing) song = { def: d.song, startStep: -1, curSection: null };
             })
             .catch(function () {});
     }
@@ -1395,7 +1558,7 @@
         if (data.chat && String(data.chat) !== String(sel)) return;
         if (t === "music_sequencer:play") play(data.loop || {}, (data.loop || {}).id);
         else if (t === "music_sequencer:stop") stop(data.id);
-        else if (t === "music_sequencer:stop_all") stopAll();
+        else if (t === "music_sequencer:stop_all") panicAudio();
         else if (t === "music_sequencer:tempo") setTempo(data.bpm);
         else if (t === "music_sequencer:meter") setMeter(data.steps);
         else if (t === "music_sequencer:sound") {
@@ -1405,6 +1568,14 @@
         else if (t === "music_sequencer:visual") {
             if (data.effect) visualCues.set(String(data.sound), String(data.effect));
             else visualCues.delete(String(data.sound));
+        }
+        else if (t === "music_sequencer:song") {
+            panicAudio();
+            song = { def: data.song || {}, startStep: -1, curSection: null };
+        }
+        else if (t === "music_sequencer:stop_song") {
+            panicAudio();
+            song = null;
         }
     }
 

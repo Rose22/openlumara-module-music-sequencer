@@ -1,4 +1,5 @@
 import re
+import time
 import core
 import channels.webui.api as webui
 
@@ -24,6 +25,19 @@ NOTE_NAMES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 DEGREE_RE = re.compile(r"^([#b]?)(-?\d{1,2})$")
 KEY_RE = re.compile(r"^([A-Ga-g])([#b]?)(\d{1,2})?\s+(.+)$")
 METER_RE = re.compile(r"^(\d{1,2})\s*/\s*(\d{1,2})$")
+NAME_RE = re.compile(r"^[\w][\w \-]{0,39}$")
+SUBDIVISIONS = {
+    "4ths": 4,
+    "8ths": 8,
+    "16ths": 16,
+    "32nds": 32,
+    "6/8": 6,
+    "triplets": 12,
+    "shuffle": 12,
+    "12/8": 12,
+    "triplet-16ths": 24,
+    "double-shuffle": 24,
+}
 SHARP_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 SCALES = {
@@ -307,13 +321,21 @@ def _velocity(value, default):
 
 def _step_velocity(ch):
     """Velocity of one drum bar-string character; None when invalid."""
-    if ch in (".", "-", " "):
+    if ch in (".", "-", "_", "0", " "):
         return 0.0
     if ch in ("x", "X"):
         return 1.0
     if "1" <= ch <= "9":
         return int(ch) / 9.0
     return None
+
+def _norm_name(name):
+    """Normalized loop key: lowercase with collapsed whitespace; '' when invalid."""
+    cleaned = re.sub(r"\s+", " ", str(name or "")).strip().lower()
+    if not cleaned or len(cleaned) > 40 or not NAME_RE.match(cleaned):
+        return ""
+    return cleaned
+
 
 
 def _parse_meter(signature):
@@ -365,17 +387,7 @@ def _resolve_pitch(value, root_midi, scale):
 
 class MusicSequencerModule(core.module.Module):
     """
-    Runs a synced multi-layer loop engine in the user's browser (Web Audio).
-    Launch drum patterns (compact bar strings) and melody loops (scale-degree
-    piano rolls over a per-loop key, e.g. 'A minor') as layers (up to 60 at
-    once) on one shared transport grid: every loop quantizes its launch to the
-    next bar and repeats over its own bar length, so 2-bar loops cycle exactly
-    twice per 4-bar loop. Loops keep playing while you chat; control them
-    later by their loop IDs (stop/start), or retune the shared tempo for
-    everything at once. define_sound designs brand-new synth voices from
-    oscillator/noise/filter/envelope recipes, usable as any other.
-    Beat-synced chat visuals render through a GLSL/WebGL overlay when the
-    browser supports it, falling back to DOM pulses otherwise.
+    Provides the AI with a full-blown music sequencer, letting your AI create loops that you can start/stop, create custom synthesizers, and arrange the loops you've created into a song. Does not need a seperate AI model. Comes with GLSL shader-based visual effects for a lightshow, right in your browser!
     """
 
     category = "Music"
@@ -401,8 +413,8 @@ class MusicSequencerModule(core.module.Module):
             self.data["tempo"] = {}
         if "meter" not in self.data:
             self.data["meter"] = {}
-        if "next_id" not in self.data:
-            self.data["next_id"] = 1
+        if "songs" not in self.data:
+            self.data["songs"] = {}
         if "sounds" not in self.data:
             self.data["sounds"] = {}
         if "visuals" not in self.data:
@@ -470,36 +482,77 @@ class MusicSequencerModule(core.module.Module):
     def _playing_count(self, chat_id):
         return sum(1 for d in self._loops(chat_id).values() if d.get("playing"))
 
-    def _next_loop_id(self):
-        lid = f"loop_{self.data.get('next_id', 1)}"
-        self.data["next_id"] = self.data.get("next_id", 1) + 1
+    def _resolve_subdivision(self, subdivision, chat_id):
+        sub = str(subdivision or "").strip().lower().replace(" ", "-")
+        if not sub:
+            return self._meter(chat_id), None
+        steps = SUBDIVISIONS.get(sub)
+        if steps is None:
+            return None, f"Unknown subdivision '{subdivision}'. Presets: {', '.join(sorted(SUBDIVISIONS))}, or '' for the meter grid."
+        return steps, None
+
+    def _song(self, chat_id):
+        return self.data.get("songs", {}).get(str(chat_id))
+
+    def _store_song(self, chat_id, song):
+        all_songs = dict(self.data.get("songs", {}))
+        if song is None:
+            all_songs.pop(str(chat_id), None)
+        else:
+            all_songs[str(chat_id)] = song
+        self.data["songs"] = all_songs
         self.data.save()
-        return lid
+
+    def _song_busy(self, chat_id):
+        song = self._song(chat_id)
+        return bool(song and song.get("playing"))
+
+    def _song_position_bars(self, song):
+        anchor = song.get("anchor") or {}
+        try:
+            bpm = float(anchor.get("bpm", 120))
+            msteps = int(anchor.get("meter_steps", 16))
+            epoch = float(anchor.get("epoch_ms", 0))
+        except (TypeError, ValueError):
+            return 0.0
+        bar_ms = msteps * (60000.0 / bpm / 4.0)
+        if bar_ms <= 0:
+            return 0.0
+        return max(0.0, (time.time() * 1000.0 - epoch) / bar_ms)
 
     # -------------------------
     #   AI TOOLS
     # -------------------------
 
     @core.module.tool
-    async def play_drum_pattern(self, steps: list, bar_length: int = 1, voice: str = "kick", volume: float = 1.0):
+    async def play_drum_pattern(self, name: str, steps: list, bar_length: int = 1, subdivision: str = "", voice: str = "kick", volume: float = 1.0):
         """
-        Launches a drum loop layer on the shared transport, joining at the next
-        restart of the longest playing loop (the "song cycle"), so it lands
-        aligned with the song rather than mid-phrase. Patterns use compact bar
-        strings: one character per 16th note, each string exactly one bar of
-        the chat's current meter (16 characters in 4/4; see set_time_signature).
-        All loops share one grid and tempo, so any bar lengths stay in sync:
-        a 2-bar loop cycles twice while a 4-bar loop plays once.
+        Launches a named drum loop on the shared transport, joining at the next
+        restart of the longest playing loop so it lands aligned with the other
+        layers rather than mid-phrase. Patterns use compact bar
+        strings: one character per grid cell (see subdivision; 16 per bar on
+        the default 4/4 grid). All loops share one tempo and bar grid, so any
+        bar lengths stay in sync: a 2-bar loop cycles twice while a 4-bar
+        loop plays once.
 
         Args:
-            steps: Bar string(s): digits 1-9 set the hit velocity (9 = full), x = 1.0, '.'/'-'/space = rest. Pass 1 string (repeats every bar) or bar_length strings (one per bar). E.g. ["x...x...x...x...", "x...x...x...5..x"] for 2 bars, or "x..5x...x..5x..." for one.
+            name: Unique name for this loop (letters, digits, spaces, '-' or '_', max 40 chars), e.g. 'kick groove'. Used by song arrangement and the loop control tools; duplicates are rejected.
+            steps: Bar string(s): digits 1-9 set the hit velocity (9 = full), x = 1.0, '.'/'-'/'_'/'0' = rest. Don't stress about exact length: spaces and '|' are stripped, so group cells in readable chunks of 4 (e.g. "x...|x...|x...|x..5"). Whatever remains is tiled (repeated, then cut at the bar boundary) to exactly fill bar_length bars - a short pattern repeats, a long one truncates, and the result says so. E.g. ["x...x...x...x...", "x...x...x...5..x"] for 2 bars, or "x..5x...x..5x..." for one, or even "x..." for a kick on each quarter.
             bar_length: Length of the loop in bars (1-32). The pattern repeats every bar_length bars.
+            subdivision: Cells per bar: '' = the chat meter's 16th grid (16 in 4/4); presets: 4ths, 8ths, 16ths, 32nds, 6/8, triplets (=12, shuffle feel), 12/8, triplet-16ths (=24), double-shuffle. Bars are always meter-long in real time; subdivision only picks how finely each bar is cut.
             voice: Drum voice: kick, snare, clap, hihat_closed, hihat_open, tom, rim, cowbell, or any custom sound name from define_sound.
             volume: Layer volume 0.0-1.0.
         """
         chat_id = self._chat_id()
         if not chat_id:
             return self.result("No active chat.", success=False)
+        if self._song_busy(chat_id):
+            return self.result("A song is playing - call stop_song first to use free loop mode.", success=False)
+        loop_id = _norm_name(name)
+        if not loop_id:
+            return self.result("name is required: 1-40 chars of letters, digits, spaces, '-' or '_'.", success=False)
+        if loop_id in self._loops(chat_id):
+            return self.result(f"A loop named '{loop_id}' already exists. remove_loop it first, or pick another name.", success=False)
         voice = str(voice).strip().lower()
         if voice not in DRUM_VOICES and voice not in self._sounds(chat_id):
             custom = ", ".join(sorted(self._sounds(chat_id))) or "none defined"
@@ -514,26 +567,27 @@ class MusicSequencerModule(core.module.Module):
             steps = [steps]
         if not isinstance(steps, list) or not steps:
             return self.result("steps must be a bar string, or a list of bar strings.", success=False)
-        if len(steps) not in (1, bars):
-            return self.result(f"steps must be 1 bar string (repeats every bar) or {bars} bar strings (one per bar).", success=False)
         if self._playing_count(chat_id) >= MAX_LAYERS:
             return self.result(f"Cannot start: {MAX_LAYERS} layers are already playing. Stop one first.", success=False)
 
-        spb = self._meter(chat_id)
+        spb, sub_err = self._resolve_subdivision(subdivision, chat_id)
+        if sub_err:
+            return self.result(sub_err, success=False)
+        # forgiving intake: join every given string, drop grouping chars, tile
+        # (repeat + truncate) to exactly bar_length * cells-per-bar.
+        raw = re.sub(r"[ |]", "", "".join(str(s) for s in steps))
+        if not raw:
+            return self.result("steps is empty after stripping grouping characters.", success=False)
         pattern = []
-        for i, bar in enumerate(steps):
-            bar = str(bar)
-            if len(bar) != spb:
-                return self.result(f"Bar string {i} is {len(bar)} characters; every bar must be exactly {spb} (the current meter, {self._meter_name(chat_id)}).", success=False)
-            for ch in bar:
-                v = _step_velocity(ch)
-                if v is None:
-                    return self.result(f"Bar string {i} has invalid character {ch!r}; use 1-9, x, '.' or '-'.", success=False)
-                pattern.append(v)
-        if len(pattern) == spb and bars > 1:
-            pattern = pattern * bars
+        for ch in raw:
+            v = _step_velocity(ch)
+            if v is None:
+                return self.result(f"Invalid character {ch!r} in steps; use 1-9, x, '.', '-', '_' or '0'.", success=False)
+            pattern.append(v)
+        target = bars * spb
+        tiled = len(pattern) != target
+        pattern = (pattern * (target // len(pattern) + 1))[:target]
 
-        loop_id = self._next_loop_id()
         definition = {
             "kind": "drum",
             "voice": voice,
@@ -547,25 +601,28 @@ class MusicSequencerModule(core.module.Module):
         loops[loop_id] = definition
         self._store_loops(chat_id, loops)
         await self._push(chat_id, {"type": "music_sequencer:play", "loop": dict(definition, id=loop_id)})
+        note = f" Pattern was {len(raw)} cells; tiled/repeat-truncated to {target}." if tiled else ""
         return self.result(
             f"Started {voice} drum loop '{loop_id}' ({bars} bar{'s' if bars > 1 else ''}, "
-            f"{self._playing_count(chat_id)}/{MAX_LAYERS} layers live).",
+            f"{self._playing_count(chat_id)}/{MAX_LAYERS} layers live).{note}",
             success=True,
         )
 
     @core.module.tool
-    async def play_note_pattern(self, notes: list, bar_length: int = 1, instrument: str = "piano", volume: float = 1.0, key: str = "C major"):
+    async def play_note_pattern(self, name: str, notes: list, bar_length: int = 1, subdivision: str = "", instrument: str = "piano", volume: float = 1.0, key: str = "C major"):
         """
-        Launches a piano-roll style melody loop layer on the shared transport,
-        joining at the next restart of the longest playing loop (the "song
-        cycle"), so its phrasing stays aligned with the rest of the song.
-        All loops share one grid and tempo, so any bar lengths stay in sync.
-        Timing is in 16th-note steps: one bar holds the chat meter's steps
-        (16 in 4/4, so a 4-bar loop spans steps 0-63).
+        Launches a named piano-roll melody loop on the shared transport,
+        joining at the next restart of the longest playing loop so its
+        phrasing stays aligned with the other layers.
+        All loops share one tempo and bar grid, so any bar lengths stay in
+        sync. Timing counts grid cells (see subdivision): on the default 4/4
+        grid a bar holds 16 cells, so a 4-bar loop spans steps 0-63.
 
         Args:
-            notes: List of notes as short lists: [pitch, start, length?, velocity?]. Write pitches as SCALE DEGREES (the default way to compose here): 1 = tonic of the key, 2-7 the following degrees, 8 = tonic an octave up, 0 = one octave down, wrapping over any scale length (degree 6 in a pentatonic = octave tonic); '#4'/'b7' alter a degree chromatically. Always use degrees unless a deliberately off-scale riff is wanted - absolute note names ('C4', 'F#5', 'Bb2') are accepted for those (note: a lowercase '#'/'b' prefix makes it a degree, so 'b7' = flat seventh degree while 'Bb3' = a note). start/length are 16th-note steps (length defaults to 4); velocity 0.0-1.0 (default 0.8). Visual cues are bound per instrument with set_visual, not per note. E.g. over key="A minor": [["1", 0, 8], ["3", 8], ["5", 12, 4, 0.7]] plays A C E.
+            name: Unique name for this loop (letters, digits, spaces, '-' or '_', max 40 chars), e.g. 'main melody'. Used by song arrangement and the loop control tools; duplicates are rejected.
+            notes: List of notes as short lists: [pitch, start, length?, velocity?]. Write pitches as SCALE DEGREES (the default way to compose here): 1 = tonic of the key, 2-7 the following degrees, 8 = tonic an octave up, 0 = one octave down, wrapping over any scale length (degree 6 in a pentatonic = octave tonic); '#4'/'b7' alter a degree chromatically. Always use degrees unless a deliberately off-scale riff is wanted - absolute note names ('C4', 'F#5', 'Bb2') are accepted for those (note: a lowercase '#'/'b' prefix makes it a degree, so 'b7' = flat seventh degree while 'Bb3' = a note). start/length are grid-step counts (length defaults to 4); a start outside the loop wraps around (start mod loop length), and lengths are clamped - no exact counting needed. velocity 0.0-1.0 (default 0.8). Visual cues are bound per instrument with set_visual, not per note. E.g. over key="A minor": [["1", 0, 8], ["3", 8], ["5", 12, 4, 0.7]] plays A C E.
             bar_length: Length of the loop in bars (1-32). The roll repeats every bar_length bars.
+            subdivision: Cells per bar: '' = the chat meter's 16th grid (16 in 4/4); presets: 4ths, 8ths, 16ths, 32nds, 6/8, triplets (=12, shuffle feel), 12/8, triplet-16ths (=24), double-shuffle. Bars are always meter-long in real time; subdivision only picks how finely each bar is cut. On 'triplets' a bar is 12 cells, so a beat spans 3 cells.
             instrument: Timbre: piano, bass, pad, lead, pluck, bells, sine, square, triangle, saw, organ, strings, synbrass, flute, musicbox, or any custom sound name from define_sound.
             volume: Layer volume 0.0-1.0.
             key: Scale of the loop as root note + scale name; the root may carry an octave (default 4). E.g. "A minor", "F# dorian", "C3 major pentatonic". Common: major, minor, harmonic/melodic minor, harmonic major, dorian, phrygian, lydian, mixolydian, locrian, whole tone, hirajoshi, octatonic, major/minor pentatonic, blues - plus every derived mode (phrygian dominant, lydian dominant, altered, ukrainian dorian, ...). An invalid name returns the full list of options.
@@ -573,6 +630,13 @@ class MusicSequencerModule(core.module.Module):
         chat_id = self._chat_id()
         if not chat_id:
             return self.result("No active chat.", success=False)
+        if self._song_busy(chat_id):
+            return self.result("A song is playing - call stop_song first to use free loop mode.", success=False)
+        loop_id = _norm_name(name)
+        if not loop_id:
+            return self.result("name is required: 1-40 chars of letters, digits, spaces, '-' or '_'.", success=False)
+        if loop_id in self._loops(chat_id):
+            return self.result(f"A loop named '{loop_id}' already exists. remove_loop it first, or pick another name.", success=False)
         instrument = str(instrument).strip().lower()
         if instrument not in INSTRUMENTS and instrument not in self._sounds(chat_id):
             custom = ", ".join(sorted(self._sounds(chat_id))) or "none defined"
@@ -593,9 +657,12 @@ class MusicSequencerModule(core.module.Module):
         if key_err:
             return self.result(key_err, success=False)
 
-        spb = self._meter(chat_id)
+        spb, sub_err = self._resolve_subdivision(subdivision, chat_id)
+        if sub_err:
+            return self.result(sub_err, success=False)
         grid = bars * spb
         clean_notes = []
+        wrapped = 0
         for i, n in enumerate(notes):
             if not isinstance(n, list) or len(n) < 2 or len(n) > 4:
                 return self.result(f"Note {i} must be a list: [pitch, start, length?, velocity?].", success=False)
@@ -607,10 +674,12 @@ class MusicSequencerModule(core.module.Module):
                 length = int(n[2]) if len(n) > 2 else 4
             except (TypeError, ValueError):
                 return self.result(f"Note {i} has non-integer start/length.", success=False)
+            # forgiving intake: starts outside the loop wrap into it (a step
+            # past the end lands at the same phase next cycle), lengths clamp.
             if start < 0 or start >= grid:
-                return self.result(f"Note {i} starts outside the loop (start must be 0-{grid - 1}).", success=False)
-            if length < 1:
-                return self.result(f"Note {i} has length < 1.", success=False)
+                wrapped += 1
+                start = start % grid
+            length = max(1, length)
             clean_notes.append({
                 "pitch": midi,
                 "start": start,
@@ -618,7 +687,6 @@ class MusicSequencerModule(core.module.Module):
                 "velocity": _velocity(n[3], 0.8) if len(n) > 3 else 0.8,
             })
 
-        loop_id = self._next_loop_id()
         definition = {
             "kind": "note",
             "instrument": instrument,
@@ -633,84 +701,97 @@ class MusicSequencerModule(core.module.Module):
         loops[loop_id] = definition
         self._store_loops(chat_id, loops)
         await self._push(chat_id, {"type": "music_sequencer:play", "loop": dict(definition, id=loop_id)})
+        note = f" {wrapped} note(s) started outside the loop and wrapped to step start mod {grid}." if wrapped else ""
         return self.result(
             f"Started {instrument} melody loop '{loop_id}' ({len(clean_notes)} notes, {bars} bar{'s' if bars > 1 else ''}, "
-            f"{self._playing_count(chat_id)}/{MAX_LAYERS} layers live).",
+            f"{self._playing_count(chat_id)}/{MAX_LAYERS} layers live).{note}",
             success=True,
         )
 
     @core.module.tool
-    async def stop_loop(self, loop_id: str):
+    async def stop_loop(self, name: str):
         """
-        Stops a running loop layer by its ID (the pattern stays known and can be
+        Stops a running loop by its name (the pattern stays known and can be
         restarted with start_loop). Silences nothing else.
 
         Args:
-            loop_id: The ID returned when the loop was started, e.g. 'loop_3'.
+            name: The loop's name, as given to play_drum_pattern/play_note_pattern.
         """
         chat_id = self._chat_id()
         if not chat_id:
             return self.result("No active chat.", success=False)
+        if self._song_busy(chat_id):
+            return self.result("A song is playing - call stop_song first to use free loop mode.", success=False)
+        loop_id = _norm_name(name)
         loops = self._loops(chat_id)
-        definition = loops.get(str(loop_id))
+        definition = loops.get(loop_id)
         if not definition:
-            return self.result(f"No loop with ID '{loop_id}' in this chat.", success=False)
+            return self.result(f"No loop named '{name}' in this chat.", success=False)
         if not definition.get("playing"):
             return self.result(f"Loop '{loop_id}' is already stopped.", success=False)
         loops = dict(loops)
-        loops[str(loop_id)] = dict(definition, playing=False)
+        loops[loop_id] = dict(definition, playing=False)
         self._store_loops(chat_id, loops)
-        await self._push(chat_id, {"type": "music_sequencer:stop", "id": str(loop_id)})
-        return self.result(f"Stopped loop '{loop_id}'.", success=True)
+        await self._push(chat_id, {"type": "music_sequencer:stop", "id": loop_id})
+        return self.result(f"Stopped loop '{name}'.", success=True)
 
     @core.module.tool
-    async def start_loop(self, loop_id: str):
+    async def start_loop(self, name: str):
         """
-        (Re)starts a loop layer by its ID. It joins the shared transport at the
-        next restart of the longest playing loop (the "song cycle"), in sync
-        with everything else already playing. Works on loops stopped earlier
-        with stop_loop; restarting a live loop has no effect.
+        (Re)starts a loop by its name. It joins the shared transport at the
+        next restart of the longest playing loop, in sync with everything
+        else already playing. Works on loops stopped earlier with stop_loop;
+        restarting a live loop has no effect.
 
         Args:
-            loop_id: The ID returned when the loop was started, e.g. 'loop_3'.
+            name: The loop's name, as given to play_drum_pattern/play_note_pattern.
         """
         chat_id = self._chat_id()
         if not chat_id:
             return self.result("No active chat.", success=False)
+        if self._song_busy(chat_id):
+            return self.result("A song is playing - call stop_song first to use free loop mode.", success=False)
+        loop_id = _norm_name(name)
         loops = self._loops(chat_id)
-        definition = loops.get(str(loop_id))
+        definition = loops.get(loop_id)
         if not definition:
-            return self.result(f"No loop with ID '{loop_id}' in this chat.", success=False)
+            return self.result(f"No loop named '{name}' in this chat.", success=False)
         if definition.get("playing"):
             return self.result(f"Loop '{loop_id}' is already playing.", success=False)
         if self._playing_count(chat_id) >= MAX_LAYERS:
             return self.result(f"Cannot start: {MAX_LAYERS} layers are already playing. Stop one first.", success=False)
         loops = dict(loops)
-        loops[str(loop_id)] = dict(definition, playing=True)
+        loops[loop_id] = dict(definition, playing=True)
         self._store_loops(chat_id, loops)
-        await self._push(chat_id, {"type": "music_sequencer:play", "loop": dict(definition, id=str(loop_id))})
-        return self.result(f"Restarted loop '{loop_id}', joining the next song cycle.", success=True)
+        await self._push(chat_id, {"type": "music_sequencer:play", "loop": dict(definition, id=loop_id)})
+        return self.result(f"Restarted loop '{name}', joining at the next cycle boundary.", success=True)
 
     @core.module.tool
-    async def remove_loop(self, loop_id: str):
+    async def remove_loop(self, name: str):
         """
-        Deletes a loop layer entirely (stops it if playing, forgets the pattern).
+        Deletes a loop entirely (stops it if playing, forgets the pattern).
 
         Args:
-            loop_id: The ID returned when the loop was started, e.g. 'loop_3'.
+            name: The loop's name, as given to play_drum_pattern/play_note_pattern.
         """
         chat_id = self._chat_id()
         if not chat_id:
             return self.result("No active chat.", success=False)
+        loop_id = _norm_name(name)
         loops = self._loops(chat_id)
-        if str(loop_id) not in loops:
-            return self.result(f"No loop with ID '{loop_id}' in this chat.", success=False)
-        was_playing = bool(loops[str(loop_id)].get("playing"))
+        if loop_id not in loops:
+            return self.result(f"No loop named '{name}' in this chat.", success=False)
+        song = self._song(chat_id)
+        if song and song.get("playing"):
+            for s in song.get("sections", []):
+                if any(l.get("name") == loop_id for l in s.get("layers", [])):
+                    return self.result(f"Loop '{loop_id}' is used by the playing song '{song.get('title')}' - stop_song first.", success=False)
+        was_playing = bool(loops[loop_id].get("playing"))
         loops = dict(loops)
-        loops.pop(str(loop_id))
+        loops.pop(loop_id)
         self._store_loops(chat_id, loops)
         if was_playing:
-            await self._push(chat_id, {"type": "music_sequencer:stop", "id": str(loop_id)})
+            await self._push(chat_id, {"type": "music_sequencer:stop", "id": loop_id})
         return self.result(f"Removed loop '{loop_id}'.", success=True)
 
     @core.module.tool
@@ -735,6 +816,13 @@ class MusicSequencerModule(core.module.Module):
         all_tempos[str(chat_id)] = tempo
         self.data["tempo"] = all_tempos
         self.data.save()
+        song = self._song(chat_id)
+        if song and song.get("playing"):
+            pos = self._song_position_bars(song)
+            anchor = dict(song.get("anchor") or {})
+            anchor["bpm"] = tempo
+            anchor["epoch_ms"] = time.time() * 1000.0 - pos * (int(anchor.get("meter_steps", 16)) * (60000.0 / tempo / 4.0))
+            self._store_song(chat_id, dict(song, anchor=anchor))
         await self._push(chat_id, {"type": "music_sequencer:tempo", "bpm": tempo})
         return self.result(f"Tempo set to {tempo:g} BPM.", success=True)
 
@@ -804,12 +892,146 @@ class MusicSequencerModule(core.module.Module):
         chat_id = self._chat_id()
         if not chat_id:
             return self.result("No active chat.", success=False)
+        if self._song_busy(chat_id):
+            return self.result("A song is playing - call stop_song instead to end it.", success=False)
         if not self._playing_count(chat_id):
             return self.result("Nothing is playing.", success=False)
         loops = {lid: dict(d, playing=False) for lid, d in self._loops(chat_id).items()}
         self._store_loops(chat_id, loops)
         await self._push(chat_id, {"type": "music_sequencer:stop_all"})
         return self.result("Stopped all loops.", success=True)
+
+    @core.module.tool
+    async def start_song(self, title: str, sections: list, loop: bool = False):
+        """
+        Arranges the chat's named loops into a full song and plays it. Stops
+        all free-running loops first; while a song plays, the loop tools are
+        rejected (stop_song to return to free mode). The arrangement then
+        plays unattended: each section switches its layers on/off exactly at
+        bar boundaries, with optional per-layer volume. Loops must already be
+        defined with the pattern tools.
+
+        Args:
+            title: Song name for display.
+            sections: Ordered arrangement; each {name?, bars, layers}. bars: 1-64 meter bars. layers: loops active in that section - each entry a loop name, or {"loop": name, "volume": 0.0-1.0}; an empty list is a break. Max 512 bars total. E.g. [{"name": "intro", "bars": 4, "layers": ["pad"]}, {"name": "verse", "bars": 8, "layers": ["pad", "kick groove", {"loop": "bassline", "volume": 0.7}]}, {"name": "chorus", "bars": 8, "layers": ["pad", "kick groove", "bassline", "lead melody"]}]
+            loop: Repeat the arrangement forever instead of ending after the final section.
+        """
+        chat_id = self._chat_id()
+        if not chat_id:
+            return self.result("No active chat.", success=False)
+        if not isinstance(sections, list) or not sections:
+            return self.result("sections must be a non-empty list of {name?, bars, layers}.", success=False)
+        loops = self._loops(chat_id)
+        clean_sections = []
+        total = 0
+        for i, s in enumerate(sections):
+            if not isinstance(s, dict):
+                return self.result(f"Section {i} must be a dict: {{name?, bars, layers}}.", success=False)
+            try:
+                bars = int(s.get("bars"))
+            except (TypeError, ValueError):
+                return self.result(f"Section {i} needs an integer 'bars'.", success=False)
+            if bars < 1 or bars > 64:
+                return self.result(f"Section {i}: bars must be between 1 and 64.", success=False)
+            total += bars
+            if total > 512:
+                return self.result("Song too long: max 512 bars total.", success=False)
+            raw_layers = s.get("layers") or []
+            if isinstance(raw_layers, str):
+                raw_layers = [raw_layers]
+            clean_layers = []
+            for l in raw_layers:
+                lname = _norm_name(l.get("loop") if isinstance(l, dict) else l)
+                if not lname:
+                    return self.result(f"Section {i} has an invalid layer name.", success=False)
+                if lname not in loops:
+                    avail = ", ".join(sorted(loops)) or "none defined"
+                    return self.result(f"Section {i} references unknown loop '{lname}'. Available: {avail}.", success=False)
+                clean_layers.append({"name": lname, "volume": _velocity(l.get("volume", 1.0), 1.0) if isinstance(l, dict) else 1.0})
+            clean_sections.append({"name": str(s.get("name") or "").strip() or f"Part {i + 1}", "bars": bars, "layers": clean_layers})
+        self._store_loops(chat_id, {lid: dict(d, playing=False) for lid, d in loops.items()})
+        await self._push(chat_id, {"type": "music_sequencer:stop_all"})
+        # stop_all is a hard cut frontend-side: anything scheduled and not yet
+        # sounded is dropped, so start the song on a fresh bar (gateSong waits
+        # for the next boundary anyway).
+        song = {
+            "title": str(title or "").strip()[:60] or "Untitled",
+            "loop": bool(loop),
+            "playing": True,
+            "total_bars": total,
+            "sections": clean_sections,
+            "anchor": {"epoch_ms": time.time() * 1000.0, "bpm": self._tempo(chat_id), "meter_steps": self._meter(chat_id)},
+        }
+        self._store_song(chat_id, song)
+        await self._push(chat_id, {"type": "music_sequencer:song", "song": dict(song)})
+        bar_sec = self._meter(chat_id) * (60.0 / self._tempo(chat_id) / 4.0)
+        plan = " / ".join(f"{s['name']} ({s['bars']})" for s in clean_sections)
+        return self.result(f"Song '{song['title']}' started: {total} bars ~{total * bar_sec:.0f}s at {self._tempo(chat_id):g} BPM {self._meter_name(chat_id)} - {plan}.", success=True)
+
+    @core.module.tool
+    async def stop_song(self):
+        """
+        Stops the playing song (all its layers fall silent) and returns the
+        chat to free loop mode. The arrangement stays defined; start_song
+        again to replay it from the top.
+        """
+        chat_id = self._chat_id()
+        if not chat_id:
+            return self.result("No active chat.", success=False)
+        song = self._song(chat_id)
+        if not song:
+            return self.result("No song defined for this chat.", success=False)
+        if not song.get("playing"):
+            return self.result("The song is not playing.", success=False)
+        self._store_song(chat_id, dict(song, playing=False))
+        self._store_loops(chat_id, {lid: dict(d, playing=False) for lid, d in self._loops(chat_id).items()})
+        await self._push(chat_id, {"type": "music_sequencer:stop_song"})
+        return self.result(f"Song '{song.get('title')}' stopped. Free loop mode is available again.", success=True)
+
+    @core.module.tool
+    async def song_status(self):
+        """
+        Shows the current song: title, the section map, where the song is
+        right now (section, bar within song), remaining time and loop flag.
+        """
+        chat_id = self._chat_id()
+        if not chat_id:
+            return self.result("No active chat.", success=False)
+        song = self._song(chat_id)
+        if not song:
+            return self.result("No song defined for this chat. Create loops first, then start_song.", success=False)
+        total = int(song.get("total_bars", 0))
+        pos = self._song_position_bars(song)
+        finished = bool(song.get("playing")) and not song.get("loop") and pos >= total
+        cur = (pos % total) if (song.get("loop") and total) else min(pos, total)
+        acc = 0
+        current = None
+        map_lines = []
+        for s in song.get("sections", []):
+            note = ""
+            if song.get("playing") and not finished and acc <= cur < acc + s["bars"]:
+                current = f"{s['name']} (bar {int(cur - acc) + 1}/{s['bars']} of section, {int(cur) + 1}/{total} of song)"
+                note = "  <- now"
+            map_lines.append(f"{s['name']} ({s['bars']} bars): {', '.join(l['name'] for l in s.get('layers', [])) or '- silence -'}{note}")
+            acc += s["bars"]
+        anchor = song.get("anchor") or {}
+        try:
+            bar_sec = int(anchor.get("meter_steps", 16)) * 60.0 / float(anchor.get("bpm", 120)) / 4.0
+        except (TypeError, ValueError):
+            bar_sec = 2.0
+        out = {
+            "title": song.get("title"),
+            "state": "finished" if finished else ("playing" if song.get("playing") else "stopped"),
+            "loop": bool(song.get("loop")),
+            "total_bars": total,
+            "map": map_lines,
+        }
+        if current:
+            out["now"] = current
+        if not song.get("loop"):
+            out["remaining_seconds"] = max(0, round((total - pos) * bar_sec))
+        return self.result(out, success=True)
+
 
     @core.module.tool
     async def set_visual(self, sound: str, effect: str = "flash"):
@@ -943,6 +1165,7 @@ class MusicSequencerModule(core.module.Module):
             "visuals": self._visuals(chat_id),
             "tempo": self._tempo(chat_id),
             "meter": self._meter(chat_id),
+            "song": self._song(chat_id),
             "master_volume": self.config.get("master_volume", 80),
         }
 
@@ -961,11 +1184,14 @@ class MusicSequencerModule(core.module.Module):
         all_visuals = dict(self.data.get("visuals", {}))
         all_visuals.pop(str(chat_id), None)
         self.data["visuals"] = all_visuals
+        all_songs = dict(self.data.get("songs", {}))
+        all_songs.pop(str(chat_id), None)
+        self.data["songs"] = all_songs
         self.data.save()
         if had_playing:
             await self._push(chat_id, {"type": "music_sequencer:stop_all"})
 
-    async def on_end_prompt(self):
+    async def on_message_inject(self):
         chat_id = self._chat_id()
         if not chat_id:
             return None
@@ -983,6 +1209,11 @@ class MusicSequencerModule(core.module.Module):
             f"Active music_sequencer layers (tempo {self._tempo(chat_id):g} BPM, new-loop meter {self._meter_name(chat_id)}):\n"
             + "\n".join(lines)
         )
+        song = self._song(chat_id)
+        if song:
+            state = "playing" if song.get("playing") else "stopped"
+            block += (f"\nSong '{song.get('title')}' ({state}, {song.get('total_bars')} bars, "
+                      f"loop {'on' if song.get('loop') else 'off'}) - use song_status for the live position.")
         custom = sorted(self._sounds(chat_id))
         if custom:
             block += f"\nCustom sounds in this chat: {', '.join(custom)}"
@@ -993,19 +1224,23 @@ class MusicSequencerModule(core.module.Module):
 
     @core.module.command("music", help={
         "": "Shows the current loop layers",
-        "stop": "Stops every playing loop",
+        "stop": "Stops the song (if any) and every playing loop",
     })
     async def music_command(self, args: list):
         chat_id = self._chat_id()
         if not chat_id:
             return "No active chat."
         if args and args[0] == "stop":
+            await self.stop_song()
             await self.stop_all_loops()
-            return "Stopped all loops."
+            return "Stopped song and all loops."
         loops = self._loops(chat_id)
         if not loops:
             return "No loop layers in this chat. Ask the AI to start one!"
         lines = [f"Tempo: {self._tempo(chat_id):g} BPM | Meter (new loops): {self._meter_name(chat_id)} | {self._playing_count(chat_id)}/{MAX_LAYERS} layers playing"]
+        song = self._song(chat_id)
+        if song:
+            lines.append(f"Song: '{song.get('title')}' ({'playing' if song.get('playing') else 'stopped'}, {song.get('total_bars')} bars, loop {'on' if song.get('loop') else 'off'})")
         for loop_id, d in loops.items():
             name = d.get("voice") or d.get("instrument")
             state = "playing" if d.get("playing") else "stopped"
