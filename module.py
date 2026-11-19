@@ -14,7 +14,11 @@ BUILTIN_NAMES = set(DRUM_VOICES) | set(INSTRUMENTS)
 
 OSC_TYPES = ["sine", "square", "sawtooth", "triangle"]
 WT_TABLES = ["harmonics", "even", "sparse"]
-EFFECTS = ["flash", "bloom", "spark", "tick", "laser", "ripple", "wave", "plasma", "aurora", "prism", "strobe"]
+EFFECTS = [
+    "flash", "bloom", "spark", "tick", "laser", "ripple", "wave", "plasma", "aurora",
+    "prism", "strobe", "pulse", "wheel", "motes", "vortex", "soundwave",
+]
+AMBIENT_EFFECTS = ["wheel", "motes", "vortex", "soundwave"]
 DEFAULT_VISUALS = {"kick": "flash", "snare": "ripple"}
 FILTER_TYPES = ["lowpass", "highpass", "bandpass"]
 SOUND_NAME_RE = re.compile(r"^[a-z][a-z0-9_\-]{0,31}$")
@@ -1034,6 +1038,8 @@ class MusicSequencerModule(core.module.Module):
 
 
     @core.module.tool
+    @core.module.tool
+    @core.module.tool
     async def set_visual(self, sound: str, effect: str = "flash"):
         """
         Attaches a chat-window visual cue to a drum voice or instrument: every
@@ -1042,14 +1048,27 @@ class MusicSequencerModule(core.module.Module):
         whatever cue their voice/instrument currently has. Defaults:
         kick->flash, snare->ripple.
 
+        Persistent effects (wheel/motes/vortex/soundwave) are strictly
+        opt-in: they exist only while a cue attaches them and NEVER turn
+        themselves on. Only enable them when the song/vibe calls for a
+        stage-wide visual, and turn them off ('off') when it ends.
+
         Args:
             sound: Voice or instrument name (built-in or custom).
-            effect: flash | bloom | spark | tick | laser | ripple | wave | plasma | aurora | prism | strobe (GLSL visuals: ripple/wave/plasma/aurora/prism/strobe; spark/tick/laser suit fast short notes; strobe is intentionally flashy), or 'off' to clear.
+            effect: One-shot: flash | bloom | spark | tick | laser | ripple |
+                wave | plasma | aurora | prism | strobe | pulse.
+                Persistent: wheel (a segmented circle that lights the
+                pitch-class segment of each note and spins one segment per
+                kick) | motes | vortex | soundwave (follows the instrument's
+                spectrum). Persistent cues stay present while attached and
+                react to their instrument. Use 'off' to clear.
         """
         chat_id = self._chat_id()
         if not chat_id:
             return self.result("No active chat.", success=False)
         snd = str(sound).strip().lower()
+        if snd in ("all", "*"):
+            snd = "master"
         fx = str(effect).strip().lower()
         if fx not in EFFECTS and fx != "off":
             return self.result(f"Unknown effect '{effect}'. Options: {', '.join(EFFECTS)}, off.", success=False)
@@ -1063,14 +1082,19 @@ class MusicSequencerModule(core.module.Module):
         return self.result(f"{'Cleared' if fx == 'off' else f'{snd} now pulses {fx}'} visual cue.", success=True)
 
     @core.module.tool
+    @core.module.tool
+    @core.module.tool
     async def list_visual_effects(self):
         """
         Lists all beat-synced visual effect names, the current per-sound cues,
-        and the built-in defaults.
+        and the built-in defaults. One-shot effects pulse on hits; persistent
+        effects (wheel/motes/vortex/soundwave) only run while a cue
+        explicitly attaches them - they are optional, never on by themselves.
         """
         chat_id = self._chat_id()
         return self.result({
             "effects": EFFECTS,
+            "persistent_effects": AMBIENT_EFFECTS,
             "defaults": DEFAULT_VISUALS,
             "active_cues": self._visuals(chat_id) if chat_id else {},
         }, success=True)
@@ -1188,6 +1212,7 @@ class MusicSequencerModule(core.module.Module):
         all_songs.pop(str(chat_id), None)
         self.data["songs"] = all_songs
         self.data.save()
+        await self._push(chat_id, {"type": "music_sequencer:visual_clear"})
         if had_playing:
             await self._push(chat_id, {"type": "music_sequencer:stop_all"})
 

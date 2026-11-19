@@ -31,6 +31,18 @@
     var vizEl = null;
     var vizQueue = [];
     var VIZ_LEAD = 0.012;
+    var AMBIENT_EFFECTS = ["wheel", "motes", "vortex", "soundwave"];
+    var SOUND_BANDS = 16;
+    var MAX_AMBIENT = 8;
+    var masterAnalyser = null;
+    var masterTimeData = null;
+    var instrumentBuses = new Map();
+    var ambientDefs = [];
+    var ambientDirty = true;
+    var audioSoundBands = new Float32Array(MAX_AMBIENT * SOUND_BANDS);
+    var audioAmbLevels = new Float32Array(MAX_AMBIENT);
+    var audioMasterLevel = 0;
+    var sentTempo = 0;
 
     function clamp01(v) { v = Number(v); if (isNaN(v)) v = 1; return Math.max(0, Math.min(1, v)); }
     function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
@@ -102,6 +114,16 @@
                 master.connect(shaper);
                 shaper.connect(comp);
                 comp.connect(ctx.destination);
+                try {
+                    masterAnalyser = ctx.createAnalyser();
+                    masterAnalyser.fftSize = 2048;
+                    masterAnalyser.smoothingTimeConstant = 0.55;
+                    comp.connect(masterAnalyser);
+                    masterTimeData = new Uint8Array(masterAnalyser.fftSize);
+                } catch (e) {
+                    masterAnalyser = null;
+                    masterTimeData = null;
+                }
                 fxIn = shaper;
                 compNode = comp;
                 try {
@@ -134,6 +156,178 @@
     /* -------------------------
      * synths (no audio assets needed)
      * ------------------------- */
+    function stableSeed(value) {
+        var h = 2166136261;
+        var s = String(value || "");
+        for (var i = 0; i < s.length; i++) {
+            h ^= s.charCodeAt(i);
+            h = Math.imul(h, 16777619);
+        }
+        return (h >>> 0) / 4294967295;
+    }
+
+    function isAmbientEffect(effect) {
+        return AMBIENT_EFFECTS.indexOf(String(effect || "").toLowerCase()) >= 0;
+    }
+
+    function isSoundwaveVisual(name) {
+        return visualCues.get(String(name)) === "soundwave";
+    }
+
+    function ensureInstrumentBus(name) {
+        if (!ctx || !master) return null;
+        var key = String(name || "");
+        if (!key) return master;
+        var ent = instrumentBuses.get(key);
+        if (!ent) {
+            try {
+                var gain = ctx.createGain();
+                gain.gain.value = 1;
+                gain.connect(master);
+                var analyser = ctx.createAnalyser();
+                analyser.fftSize = 512;
+                analyser.smoothingTimeConstant = 0.82;
+                gain.connect(analyser);
+                ent = { gain: gain, analyser: analyser, data: new Uint8Array(analyser.frequencyBinCount) };
+                instrumentBuses.set(key, ent);
+            } catch (e) {
+                return master;
+            }
+        }
+        return ent.gain;
+    }
+
+    function audioOut(name) {
+        if (!isSoundwaveVisual(name)) return master;
+        return ensureInstrumentBus(name) || master;
+    }
+
+    /* RMS loudness of one instrument bus; instant attack, smooth release, so
+       the soundwave visualiser can fade with the volume it is attached to */
+    function busLevel(ent) {
+        if (!ent || !ent.analyser) return 0;
+        try {
+            if (!ent.time) ent.time = new Uint8Array(ent.analyser.fftSize);
+            ent.analyser.getByteTimeDomainData(ent.time);
+            var sum = 0;
+            for (var i = 0; i < ent.time.length; i++) {
+                var v = (ent.time[i] - 128) / 128;
+                sum += v * v;
+            }
+            var rms = Math.min(1, Math.sqrt(sum / ent.time.length) * 3.0 * (masterVolume / 100));
+            var prev = ent.level || 0;
+            ent.level = rms > prev ? rms : prev * 0.90 + rms * 0.10;
+            return ent.level;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    function bandLevels(analyser, data, out, low, high) {
+        if (!ctx || !analyser || !data || !out) return;
+        analyser.getByteFrequencyData(data);
+        var bins = data.length;
+        var hzPerBin = (ctx.sampleRate || 44100) / Math.max(2, analyser.fftSize);
+        var ratio = high / Math.max(1, low);
+        for (var i = 0; i < out.length; i++) {
+            var f0 = low * Math.pow(ratio, i / out.length);
+            var f1 = low * Math.pow(ratio, (i + 1) / out.length);
+            var b0 = Math.max(0, Math.min(bins - 1, Math.floor(f0 / hzPerBin)));
+            var b1 = Math.min(bins - 1, Math.floor(f1 / hzPerBin));
+            if (b1 < b0) b1 = b0;
+            var total = 0;
+            for (var b = b0; b <= b1; b++) total += data[b];
+            var level = total / ((b1 - b0 + 1) * 255);
+            out[i] = Math.min(1, Math.pow(level, 0.72) * 1.25);
+        }
+    }
+
+    function updateMasterLevel() {
+        audioMasterLevel = 0;
+        if (!masterAnalyser || !masterTimeData) return;
+        try {
+            masterAnalyser.getByteTimeDomainData(masterTimeData);
+            var sum = 0;
+            for (var i = 0; i < masterTimeData.length; i++) {
+                var v = (masterTimeData[i] - 128) / 128;
+                sum += v * v;
+            }
+            audioMasterLevel = Math.min(1, Math.sqrt(sum / masterTimeData.length) * 2.4);
+        } catch (e) {
+            audioMasterLevel = 0;
+        }
+    }
+
+    function syncAmbientDefs() {
+        ambientDirty = false;
+        var items = [];
+        visualCues.forEach(function (fx, voice) {
+            fx = String(fx || "").toLowerCase();
+            voice = String(voice || "");
+            if (!isAmbientEffect(fx)) return;
+            if (voice === "master") return;
+            items.push({ fx: fx, voice: voice });
+        });
+        var nonEq = items.slice(0, MAX_AMBIENT);
+        var defs = [];
+        var laneCount = nonEq.length;
+        for (var j = 0; j < nonEq.length; j++) {
+            var item = nonEq[j];
+            var x = laneCount <= 1 ? 0.5 : 0.08 + j * (0.84 / (laneCount - 1));
+            var y = laneCount <= 1 ? 0.55 : 0.20 + j * (0.60 / (laneCount - 1));
+            if (item.fx === "wheel") {
+                x = 0.5;
+                y = 0.56;
+            } else if (item.fx === "motes") {
+                y = 0.08;
+            } else if (item.fx === "vortex") {
+                y = 0.5;
+            } else if (item.fx === "soundwave") {
+                x = 0.5;
+                y = 0.16 + stableSeed(item.voice + "|waveY") * 0.68;
+            }
+            defs.push({
+                effect: item.fx,
+                name: item.voice,
+                x: x,
+                y: y,
+                color: colorFor(item.voice),
+                seed: stableSeed(item.voice),
+                speed: Math.max(0.02, bpm / 120)
+            });
+        }
+        ambientDefs = defs;
+        if (window.MusicSequencerShaderFx && window.MusicSequencerShaderFx.setAmbient) {
+            window.MusicSequencerShaderFx.setAmbient(defs);
+        }
+    }
+
+    function sendAmbientAudio() {
+        var fx = window.MusicSequencerShaderFx;
+        if (!fx || !ambientDefs.length) return;
+        var running = !!(ctx && ctx.state === "running");
+        for (var k = 0; k < audioSoundBands.length; k++) audioSoundBands[k] = 0;
+        for (var q = 0; q < audioAmbLevels.length; q++) audioAmbLevels[q] = 0;
+        if (!running) {
+            audioMasterLevel = 0;
+            instrumentBuses.forEach(function (e) { e.level = 0; });
+            if (fx.setAudioData) fx.setAudioData({ bands: audioSoundBands, levels: audioAmbLevels, master: audioMasterLevel });
+            return;
+        }
+        if (masterAnalyser) updateMasterLevel();
+        else audioMasterLevel = 0;
+        for (var j = 0; j < ambientDefs.length && j < MAX_AMBIENT; j++) {
+            if (ambientDefs[j].effect !== "soundwave") continue;
+            var ent = instrumentBuses.get(String(ambientDefs[j].name));
+            if (!ent || !ent.analyser) continue;
+            var offset = j * SOUND_BANDS;
+            var slice = audioSoundBands.subarray(offset, offset + SOUND_BANDS);
+            bandLevels(ent.analyser, ent.data, slice, 35, 10000);
+            audioAmbLevels[j] = busLevel(ent);
+        }
+        if (fx.setAudioData) fx.setAudioData({ bands: audioSoundBands, levels: audioAmbLevels, master: audioMasterLevel });
+    }
+
     function noiseBuffer() {
         if (noiseBuf) return noiseBuf;
         var len = Math.floor(ctx.sampleRate * 2);
@@ -177,7 +371,7 @@
         return ir;
     }
 
-    function envFiltered(when, peak, attack, decay, freq) {
+    function envFiltered(when, peak, attack, decay, freq, dest) {
         var g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, when);
         g.gain.exponentialRampToValueAtTime(Math.max(0.0005, peak), when + attack);
@@ -186,7 +380,7 @@
         f.type = "bandpass";
         f.frequency.setValueAtTime(freq, when);
         g.connect(f);
-        f.connect(master);
+        f.connect(dest || master);
         return g;
     }
 
@@ -198,8 +392,8 @@
         return o;
     }
 
-    function noiseHit(when, peak, attack, decay, filterType, freq, q) {
-        var g = env(when, peak, attack, decay);
+    function noiseHit(when, peak, attack, decay, filterType, freq, q, dest) {
+        var g = env(when, peak, attack, decay, dest);
         var src = ctx.createBufferSource();
         src.buffer = noiseBuffer();
         src.loop = true;
@@ -214,13 +408,13 @@
     }
 
     /* tiny bright noise transient for kick attack */
-    function clickHit(when, peak) {
-        noiseHit(when, peak, 0.0005, 0.01, "highpass", 2600);
+    function clickHit(when, peak, dest) {
+        noiseHit(when, peak, 0.0005, 0.01, "highpass", 2600, 0, dest);
     }
 
     /* TR-808-style metallic hat: six detuned square oscillators at inharmonic
        ratios, highpassed - far more "metal" than plain filtered noise */
-    function metalHat(when, peak, decay, hpFreq) {
+    function metalHat(when, peak, decay, hpFreq, dest) {
         var g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, when);
         g.gain.exponentialRampToValueAtTime(Math.max(0.0005, peak), when + 0.001);
@@ -230,7 +424,7 @@
         f.frequency.setValueAtTime(hpFreq, when);
         f.Q.value = 1.4;
         g.connect(f);
-        f.connect(master);
+        f.connect(dest || master);
         var ratios = [2, 3, 4.16, 5.43, 6.79, 8.21];
         for (var i = 0; i < ratios.length; i++) {
             var o = burst(62 * ratios[i], "square", when, g);
@@ -264,12 +458,13 @@
             release: num(raw.release, 0.15, 0.005, 20)
         };
     }
-    function fmHit(patch, freq, when, vel, gate) {
+    function fmHit(patch, freq, when, vel, gate, dest) {
         var raw = (patch && patch.operators) || [];
         var out = (patch && patch.output) || [];
         var n = Math.min(raw.length, 6);
         if (!n || !out.length) return;
         vel = clamp01(vel == null ? 1 : vel);
+        dest = dest || master;
 
         /* pass 1 - validate: every index and envelope time is parsed and
            defaulted before a single audio node exists, so pass 2 cannot
@@ -340,7 +535,7 @@
             }
             osc.start(when);
             osc.stop(end + 0.02);
-            if (isCarrier[i]) g.connect(master);
+            if (isCarrier[i]) g.connect(dest);
             oscs[i] = osc;
             envs[i] = g;
             if (end > endAt) endAt = end;
@@ -587,8 +782,9 @@
         }
     }
 
-    function customHit(def, freq, when, vel, gate) {
-        if (def.fm) fmHit(def.fm, freq, when, vel, gate);
+    function customHit(def, freq, when, vel, gate, dest) {
+        dest = dest || master;
+        if (def.fm) fmHit(def.fm, freq, when, vel, gate, dest);
         var e = def.env || {};
         var attack = e.attack != null ? e.attack : 0.005;
         var decay = e.decay != null ? e.decay : 0.3;
@@ -597,7 +793,7 @@
         var peak = Math.max(0.0005, vel * 0.6);
 
         var amp = ctx.createGain();
-        amp.connect(master);
+        amp.connect(dest);
         amp.gain.setValueAtTime(0.0001, when);
         amp.gain.exponentialRampToValueAtTime(peak, when + attack);
         var stopAt;
@@ -695,17 +891,18 @@
         }
     }
 
-    function drumHit(name, when, vel) {
+    function drumHit(name, when, vel, dest) {
+        dest = dest || master;
         var custom = sounds.get(String(name));
         if (custom) {
-            customHit(custom, midiToFreq(custom.base_note || 36), when, vel, null);
+            customHit(custom, midiToFreq(custom.base_note || 36), when, vel, null, dest);
             return;
         }
         var o;
         switch (name) {
             case "kick": {
-                clickHit(when, vel * 0.4);
-                var g = env(when, vel * 0.9, 0.003, 0.4);
+                clickHit(when, vel * 0.4, dest);
+                var g = env(when, vel * 0.9, 0.003, 0.4, dest);
                 o = burst(170, "sine", when, g);
                 o.frequency.exponentialRampToValueAtTime(45, when + 0.09);
                 o.frequency.exponentialRampToValueAtTime(38, when + 0.4);
@@ -713,51 +910,51 @@
                 break;
             }
             case "snare": {
-                noiseHit(when, vel * 0.5, 0.002, 0.18, "highpass", 1800);
-                noiseHit(when, vel * 0.3, 0.001, 0.05, "bandpass", 3400, 0.9);
-                var g2 = env(when, vel * 0.42, 0.002, 0.09);
+                noiseHit(when, vel * 0.5, 0.002, 0.18, "highpass", 1800, 0, dest);
+                noiseHit(when, vel * 0.3, 0.001, 0.05, "bandpass", 3400, 0.9, dest);
+                var g2 = env(when, vel * 0.42, 0.002, 0.09, dest);
                 o = burst(190, "triangle", when, g2);
                 o.frequency.exponentialRampToValueAtTime(165, when + 0.09);
                 o.start(when); o.stop(when + 0.12);
-                var g3 = env(when, vel * 0.16, 0.002, 0.06);
+                var g3 = env(when, vel * 0.16, 0.002, 0.06, dest);
                 var o3 = burst(335, "triangle", when, g3);
                 o3.start(when); o3.stop(when + 0.09);
                 break;
             }
             case "clap": {
-                noiseHit(when, vel * 0.28, 0.001, 0.02, "bandpass", 1100, 1.2);
-                noiseHit(when + 0.011, vel * 0.28, 0.001, 0.02, "bandpass", 1150, 1.2);
-                noiseHit(when + 0.022, vel * 0.36, 0.001, 0.025, "bandpass", 1200, 1.2);
-                noiseHit(when + 0.034, vel * 0.45, 0.002, 0.16, "bandpass", 1250, 1.5);
+                noiseHit(when, vel * 0.28, 0.001, 0.02, "bandpass", 1100, 1.2, dest);
+                noiseHit(when + 0.011, vel * 0.28, 0.001, 0.02, "bandpass", 1150, 1.2, dest);
+                noiseHit(when + 0.022, vel * 0.36, 0.001, 0.025, "bandpass", 1200, 1.2, dest);
+                noiseHit(when + 0.034, vel * 0.45, 0.002, 0.16, "bandpass", 1250, 1.5, dest);
                 break;
             }
             case "hihat_closed":
-                metalHat(when, vel * 0.28, 0.055, 9000);
+                metalHat(when, vel * 0.28, 0.055, 9000, dest);
                 break;
             case "hihat_open":
-                metalHat(when, vel * 0.24, 0.42, 8000);
+                metalHat(when, vel * 0.24, 0.42, 8000, dest);
                 break;
             case "tom": {
-                noiseHit(when, vel * 0.1, 0.002, 0.02, "lowpass", 900);
-                var gt = env(when, vel * 0.7, 0.003, 0.3);
+                noiseHit(when, vel * 0.1, 0.002, 0.02, "lowpass", 900, 0, dest);
+                var gt = env(when, vel * 0.7, 0.003, 0.3, dest);
                 o = burst(210, "sine", when, gt);
                 o.frequency.exponentialRampToValueAtTime(92, when + 0.22);
                 o.start(when); o.stop(when + 0.35);
-                var go = env(when, vel * 0.12, 0.003, 0.16);
+                var go = env(when, vel * 0.12, 0.003, 0.16, dest);
                 var o2 = burst(420, "sine", when, go);
                 o2.frequency.exponentialRampToValueAtTime(185, when + 0.14);
                 o2.start(when); o2.stop(when + 0.22);
                 break;
             }
             case "rim": {
-                var gr = envFiltered(when, vel * 0.5, 0.001, 0.03, 1700);
+                var gr = envFiltered(when, vel * 0.5, 0.001, 0.03, 1700, dest);
                 o = burst(1700, "square", when, gr);
                 o.start(when); o.stop(when + 0.05);
-                noiseHit(when, vel * 0.12, 0.001, 0.015, "highpass", 2200);
+                noiseHit(when, vel * 0.12, 0.001, 0.015, "highpass", 2200, 0, dest);
                 break;
             }
             case "cowbell": {
-                var gc = envFiltered(when, vel * 0.35, 0.001, 0.3, 2600);
+                var gc = envFiltered(when, vel * 0.35, 0.001, 0.3, 2600, dest);
                 var a = burst(540, "square", when, gc);
                 var b = burst(800, "square", when, gc);
                 a.start(when); a.stop(when + 0.35);
@@ -767,19 +964,20 @@
         }
     }
 
-    function pluckVoice(type, freq, when, dur, peak) {
+    function pluckVoice(type, freq, when, dur, peak, dest) {
         var hold = Math.max(0.12, dur);
         var g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, when);
         g.gain.exponentialRampToValueAtTime(Math.max(0.0005, peak), when + 0.006);
         g.gain.exponentialRampToValueAtTime(0.0001, when + hold);
-        g.connect(master);
+        g.connect(dest || master);
         var o = burst(freq, type, when, g);
         o.start(when);
         o.stop(when + hold + 0.05);
     }
 
-    function sustainVoice(type, freq, when, dur, peak, atk, rel, cutoff, vib) {
+    function sustainVoice(type, freq, when, dur, peak, atk, rel, cutoff, vib, dest) {
+        dest = dest || master;
         var hold = Math.max(0.08, dur);
         var g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, when);
@@ -791,9 +989,9 @@
             f.type = "lowpass";
             f.frequency.setValueAtTime(cutoff, when);
             g.connect(f);
-            f.connect(master);
+            f.connect(dest);
         } else {
-            g.connect(master);
+            g.connect(dest);
         }
         var o = burst(freq, type, when, g);
         if (vib) {
@@ -817,7 +1015,8 @@
        FM_PAD layer on top for glassy shimmer. The amp swell is fast and
        two-stage (near-immediate body, gentle push to full level) so pads land
        on the beat; the filter still opens over 0.3s for the classic bloom. */
-    function padVoice(freq, when, dur, vel) {
+    function padVoice(freq, when, dur, vel, dest) {
+        dest = dest || master;
         var hold = Math.max(0.15, dur);
         var atk = Math.min(0.05, Math.max(0.008, dur * 0.04));
         var rel = 0.7;
@@ -836,7 +1035,7 @@
         f.frequency.setValueAtTime(Math.min(500, Math.max(120, freq * 1.4)), when);
         f.frequency.exponentialRampToValueAtTime(Math.min(2800, Math.max(600, freq * 4)), when + 0.3);
         amp.connect(f);
-        f.connect(master);
+        f.connect(dest);
         var lfo = ctx.createOscillator();
         lfo.type = "sine";
         lfo.frequency.value = 4.6;
@@ -870,85 +1069,86 @@
         sg.connect(amp);
         sub.start(when);
         sub.stop(when + hold + rel + 0.1);
-        fmHit(FM_PAD, freq, when, vel * 0.18, hold);
+        fmHit(FM_PAD, freq, when, vel * 0.18, hold, dest);
     }
 
-    function noteHit(kind, midi, when, dur, vel) {
+    function noteHit(kind, midi, when, dur, vel, dest) {
+        dest = dest || master;
         var f = midiToFreq(midi);
         var custom = sounds.get(String(kind));
         if (custom) {
-            customHit(custom, f, when, vel, Math.max(0.05, dur));
+            customHit(custom, f, when, vel, Math.max(0.05, dur), dest);
             return;
         }
         switch (kind) {
             case "piano": {
                 var pd = Math.max(dur, 0.5) + vel * 0.5;
-                pluckVoice("triangle", f, when, pd, vel * 0.45);
-                pluckVoice("sine", f * 2, when, pd * 0.55, vel * 0.14);
-                pluckVoice("sine", f * 3, when, pd * 0.3, vel * 0.05);
-                noiseHit(when, vel * 0.05, 0.001, 0.025, "lowpass", 900);
+                pluckVoice("triangle", f, when, pd, vel * 0.45, dest);
+                pluckVoice("sine", f * 2, when, pd * 0.55, vel * 0.14, dest);
+                pluckVoice("sine", f * 3, when, pd * 0.3, vel * 0.05, dest);
+                noiseHit(when, vel * 0.05, 0.001, 0.025, "lowpass", 900, 0, dest);
                 break;
             }
             case "pluck":
-                pluckVoice("triangle", f, when, Math.min(dur, 0.35), vel * 0.42);
-                pluckVoice("triangle", f * 1.003, when, Math.min(dur, 0.28), vel * 0.18);
-                pluckVoice("sine", f * 2, when, Math.min(dur, 0.12), vel * 0.12);
+                pluckVoice("triangle", f, when, Math.min(dur, 0.35), vel * 0.42, dest);
+                pluckVoice("triangle", f * 1.003, when, Math.min(dur, 0.28), vel * 0.18, dest);
+                pluckVoice("sine", f * 2, when, Math.min(dur, 0.12), vel * 0.12, dest);
                 break;
             case "bass":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.45, 0.008, 0.08, Math.min(f * 3.5, 950));
-                sustainVoice("sine", Math.max(30, f * 0.5), when, dur, vel * 0.25, 0.015, 0.08, 0);
+                sustainVoice("sawtooth", f, when, dur, vel * 0.45, 0.008, 0.08, Math.min(f * 3.5, 950), null, dest);
+                sustainVoice("sine", Math.max(30, f * 0.5), when, dur, vel * 0.25, 0.015, 0.08, 0, null, dest);
                 break;
             case "lead":
-                sustainVoice("square", f, when, dur, vel * 0.24, 0.01, 0.06, 3200, { rate: 5.8, depth: 8, delay: 0.25 });
-                sustainVoice("sawtooth", f * 1.005, when, dur, vel * 0.1, 0.01, 0.06, 3200, { rate: 5.8, depth: 8, delay: 0.25 });
+                sustainVoice("square", f, when, dur, vel * 0.24, 0.01, 0.06, 3200, { rate: 5.8, depth: 8, delay: 0.25 }, dest);
+                sustainVoice("sawtooth", f * 1.005, when, dur, vel * 0.1, 0.01, 0.06, 3200, { rate: 5.8, depth: 8, delay: 0.25 }, dest);
                 break;
             case "pad":
-                padVoice(f, when, dur, vel);
+                padVoice(f, when, dur, vel, dest);
                 break;
             case "bells":
-                pluckVoice("sine", f, when, Math.max(dur, 1.2), vel * 0.4);
-                pluckVoice("sine", f * 2.76, when, Math.max(dur, 1.2) * 0.6, vel * 0.13);
-                pluckVoice("sine", f * 5.4, when, Math.max(dur, 1.2) * 0.3, vel * 0.06);
+                pluckVoice("sine", f, when, Math.max(dur, 1.2), vel * 0.4, dest);
+                pluckVoice("sine", f * 2.76, when, Math.max(dur, 1.2) * 0.6, vel * 0.13, dest);
+                pluckVoice("sine", f * 5.4, when, Math.max(dur, 1.2) * 0.3, vel * 0.06, dest);
                 break;
             case "sine":
-                sustainVoice("sine", f, when, dur, vel * 0.4, 0.01, 0.12, 0);
+                sustainVoice("sine", f, when, dur, vel * 0.4, 0.01, 0.12, 0, null, dest);
                 break;
             case "square":
-                sustainVoice("square", f, when, dur, vel * 0.22, 0.01, 0.1, Math.min(f * 6, 9000));
+                sustainVoice("square", f, when, dur, vel * 0.22, 0.01, 0.1, Math.min(f * 6, 9000), null, dest);
                 break;
             case "triangle":
-                sustainVoice("triangle", f, when, dur, vel * 0.35, 0.01, 0.12, 0);
+                sustainVoice("triangle", f, when, dur, vel * 0.35, 0.01, 0.12, 0, null, dest);
                 break;
             case "saw":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.28, 0.01, 0.1, Math.min(f * 5, 8000));
+                sustainVoice("sawtooth", f, when, dur, vel * 0.28, 0.01, 0.1, Math.min(f * 5, 8000), null, dest);
                 break;
             case "organ":
-                sustainVoice("sine", f, when, dur, vel * 0.28, 0.02, 0.15, 0);
-                sustainVoice("sine", f * 2, when, dur, vel * 0.16, 0.02, 0.15, 0);
-                sustainVoice("sine", f * 3, when, dur, vel * 0.09, 0.02, 0.15, 0);
-                sustainVoice("sine", f * 4, when, dur, vel * 0.05, 0.02, 0.15, 0);
+                sustainVoice("sine", f, when, dur, vel * 0.28, 0.02, 0.15, 0, null, dest);
+                sustainVoice("sine", f * 2, when, dur, vel * 0.16, 0.02, 0.15, 0, null, dest);
+                sustainVoice("sine", f * 3, when, dur, vel * 0.09, 0.02, 0.15, 0, null, dest);
+                sustainVoice("sine", f * 4, when, dur, vel * 0.05, 0.02, 0.15, 0, null, dest);
                 break;
             case "strings":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.17, 0.09, 0.35, Math.min(f * 3, 3000), { rate: 5.2, depth: 7, delay: 0.4 });
-                sustainVoice("sawtooth", f * 1.008, when, dur, vel * 0.15, 0.1, 0.35, Math.min(f * 3, 3000), { rate: 5.5, depth: 7, delay: 0.5 });
-                sustainVoice("sawtooth", f * 0.995, when, dur, vel * 0.12, 0.11, 0.35, Math.min(f * 3, 3000), { rate: 4.9, depth: 7, delay: 0.45 });
+                sustainVoice("sawtooth", f, when, dur, vel * 0.17, 0.09, 0.35, Math.min(f * 3, 3000), { rate: 5.2, depth: 7, delay: 0.4 }, dest);
+                sustainVoice("sawtooth", f * 1.008, when, dur, vel * 0.15, 0.1, 0.35, Math.min(f * 3, 3000), { rate: 5.5, depth: 7, delay: 0.5 }, dest);
+                sustainVoice("sawtooth", f * 0.995, when, dur, vel * 0.12, 0.11, 0.35, Math.min(f * 3, 3000), { rate: 4.9, depth: 7, delay: 0.45 }, dest);
                 break;
             case "synbrass":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.22, 0.03, 0.12, Math.min(f * 8, 4500), { rate: 5, depth: 5, delay: 0.4 });
-                sustainVoice("square", f * 1.006, when, dur, vel * 0.1, 0.03, 0.12, Math.min(f * 6, 3500), { rate: 5, depth: 5, delay: 0.4 });
+                sustainVoice("sawtooth", f, when, dur, vel * 0.22, 0.03, 0.12, Math.min(f * 8, 4500), { rate: 5, depth: 5, delay: 0.4 }, dest);
+                sustainVoice("square", f * 1.006, when, dur, vel * 0.1, 0.03, 0.12, Math.min(f * 6, 3500), { rate: 5, depth: 5, delay: 0.4 }, dest);
                 break;
             case "flute":
-                sustainVoice("sine", f, when, dur, vel * 0.3, 0.06, 0.15, 0, { rate: 5.2, depth: 14, delay: 0.3 });
-                sustainVoice("sine", f * 2, when, dur, vel * 0.05, 0.08, 0.15, 0, { rate: 5.2, depth: 14, delay: 0.35 });
-                noiseHit(when, vel * 0.03, 0.06, Math.max(dur, 0.2), "bandpass", f * 1.4);
+                sustainVoice("sine", f, when, dur, vel * 0.3, 0.06, 0.15, 0, { rate: 5.2, depth: 14, delay: 0.3 }, dest);
+                sustainVoice("sine", f * 2, when, dur, vel * 0.05, 0.08, 0.15, 0, { rate: 5.2, depth: 14, delay: 0.35 }, dest);
+                noiseHit(when, vel * 0.03, 0.06, Math.max(dur, 0.2), "bandpass", f * 1.4, 0, dest);
                 break;
             case "musicbox":
-                pluckVoice("sine", f, when, Math.max(dur, 0.8), vel * 0.38);
-                pluckVoice("sine", f * 5.4, when, Math.max(dur, 0.8) * 0.35, vel * 0.1);
-                pluckVoice("sine", f * 8.93, when, Math.max(dur, 0.8) * 0.2, vel * 0.04);
+                pluckVoice("sine", f, when, Math.max(dur, 0.8), vel * 0.38, dest);
+                pluckVoice("sine", f * 5.4, when, Math.max(dur, 0.8) * 0.35, vel * 0.1, dest);
+                pluckVoice("sine", f * 8.93, when, Math.max(dur, 0.8) * 0.2, vel * 0.04, dest);
                 break;
             case "fm":
-                fmHit(FM_EP, f, when, vel, Math.max(0.05, dur));
+                fmHit(FM_EP, f, when, vel, Math.max(0.05, dur), dest);
                 break;
         }
     }
@@ -1091,16 +1291,18 @@
         plasma: "bloom",
         aurora: "bloom",
         prism: "laser",
-        strobe: "flash"
+        strobe: "flash",
+        spiral: "bloom",
+        pulse: "flash"
     };
 
-    function fireViz(effect, midi, color, dur, vel, source) {
+    function fireViz(effect, midi, color, dur, vel, source, voice) {
         if (!effect) return;
         try {
             if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
         } catch (e) {}
         var cell = midi != null ? pitchToCell(midi) : null;
-        if (window.MusicSequencerShaderFx && window.MusicSequencerShaderFx.trigger(effect, cell, color, dur, vel, source)) return;
+        if (window.MusicSequencerShaderFx && window.MusicSequencerShaderFx.trigger(effect, cell, color, dur, vel, source, voice, midi)) return;
 
         var fallback = SHADER_DOM_FALLBACK[effect] || effect;
         if (fallback === "spark") { spawnPulse("msq-spark-dot", cell ? cell.x : 50, cell ? cell.y : 62, color); return; }
@@ -1129,6 +1331,8 @@
        rAF against ctx.currentTime, never by drifting wall-clock timers. */
     function pumpViz() {
         requestAnimationFrame(pumpViz);
+        var fx = window.MusicSequencerShaderFx;
+        if (fx && ambientDirty) syncAmbientDefs();
         if (ctx && vizQueue.length) {
             var now = ctx.currentTime - VIZ_LEAD;
             var keep = [];
@@ -1136,11 +1340,18 @@
                 var e = vizQueue[i];
                 if (e.t > now) { keep.push(e); continue; }
                 if (now - e.t > 0.25) continue;
-                fireViz(e.effect, e.midi, e.color, e.dur, e.vel, e.src);
+                fireViz(e.effect, e.midi, e.color, e.dur, e.vel, e.src, e.voice);
             }
             vizQueue = keep;
         }
-        if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.render();
+        if (fx) {
+            if (sentTempo !== bpm) {
+                if (fx.setTempo) fx.setTempo(bpm);
+                sentTempo = bpm;
+            }
+            sendAmbientAudio();
+            fx.render();
+        }
     }
     requestAnimationFrame(pumpViz);
 
@@ -1163,18 +1374,21 @@
         var t0 = loop.occT0;
         if (d.kind === "drum") {
             var cue = visualCues.get(String(d.voice));
+            var voiceOut = audioOut(d.voice);
             var steps = d.steps || [];
             for (var i = 0; i < steps.length; i++) {
                 var off = i * ratio;
                 if (steps[i] > 0 && off >= from && off < to) {
                     var when = t0 + i * cellSpan;
-                    drumHit(d.voice, when, steps[i] * loop.volume);
-                    if (cue) vizQueue.push({ loop: loop, t: when, effect: cue, midi: null, color: colorFor(d.voice), vel: steps[i], src: d.id ? String(d.id) : null });
+                    drumHit(d.voice, when, steps[i] * loop.volume, voiceOut);
+                    if (cue) vizQueue.push({ loop: loop, t: when, effect: cue, voice: d.voice, midi: null, color: colorFor(d.voice), vel: steps[i], src: d.id ? String(d.id) : null });
+                    if (d.voice === "kick" && window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.wheelKick(when);
                 }
             }
         } else if (d.kind === "note") {
             var cueN = visualCues.get(String(d.instrument));
             var noteColor = colorFor(d.instrument);
+            var noteOut = audioOut(d.instrument);
             var notes = d.notes || [];
             for (var j = 0; j < notes.length; j++) {
                 var n = notes[j];
@@ -1182,8 +1396,8 @@
                 if (offN >= from && offN < to) {
                     var whenN = t0 + n.start * cellSpan;
                     var durN = Math.max(0.05, n.length * cellSpan);
-                    noteHit(d.instrument, n.pitch, whenN, durN, n.velocity * loop.volume);
-                    if (cueN) vizQueue.push({ loop: loop, t: whenN, effect: cueN, midi: n.pitch, color: noteColor, dur: durN, vel: n.velocity, src: d.id ? String(d.id) : null });
+                    noteHit(d.instrument, n.pitch, whenN, durN, n.velocity * loop.volume, noteOut);
+                    if (cueN) vizQueue.push({ loop: loop, t: whenN, effect: cueN, voice: d.instrument, midi: n.pitch, color: noteColor, dur: durN, vel: n.velocity, src: d.id ? String(d.id) : null });
                 }
             }
         }
@@ -1356,6 +1570,13 @@
             master.connect(fxIn);
             if (verbSend) master.connect(verbSend);
         } catch (e) {}
+        instrumentBuses.forEach(function (ent) {
+            try { ent.gain.disconnect(); } catch (e) {}
+            try {
+                ent.gain.connect(master);
+                ent.gain.connect(ent.analyser);
+            } catch (e) {}
+        });
         if (verbNode && compNode) {
             setTimeout(function () {
                 if (gen !== localSeq) return;
@@ -1455,6 +1676,7 @@
             voice = String(voice);
             if (!effect) visualCues.delete(voice);
             else visualCues.set(voice, String(effect));
+            ambientDirty = true;
         },
         listVisuals: function () {
             var out = [];
@@ -1503,6 +1725,12 @@
         try { return Alpine.store("chat").selectedChat || null; } catch (e) { return null; }
     }
 
+    function seedDefaultVisuals() {
+        if (!visualCues.has("kick")) visualCues.set("kick", "flash");
+        if (!visualCues.has("snare")) visualCues.set("snare", "ripple");
+        ambientDirty = true;
+    }
+
     function loadChat(chatId) {
         curChat = chatId;
         /* hard cut the old chat: kill scheduled notes too, not just future
@@ -1511,13 +1739,22 @@
         panicAudio();
         loops.clear();
         sounds.clear();
+        visualCues.clear();
         vizQueue = [];
-        if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.clear();
+        ambientDefs = [];
+        ambientDirty = true;
+        if (window.MusicSequencerShaderFx) {
+            if (window.MusicSequencerShaderFx.clearAmbient) window.MusicSequencerShaderFx.clearAmbient();
+            window.MusicSequencerShaderFx.clear();
+        }
         if (typeof simpleApiFetch !== "function") {
             setTimeout(function () { loadChat(chatId); }, 300);
             return;
         }
-        if (!chatId) return;
+        if (!chatId) {
+            seedDefaultVisuals();
+            return;
+        }
         simpleApiFetch("/api/ext/music_sequencer/state?chat=" + encodeURIComponent(chatId))
             .then(function (d) {
                 if (!d || String(curChat) !== String(chatId)) return;
@@ -1527,7 +1764,13 @@
                 var sd = d.sounds || {};
                 Object.keys(sd).forEach(function (sn) { sounds.set(sn, sd[sn]); });
                 var vc = d.visuals || {};
-                Object.keys(vc).forEach(function (vn) { visualCues.set(vn, vc[vn]); });
+                Object.keys(vc).forEach(function (vn) {
+                    var vfx = String(vc[vn] || "").toLowerCase();
+                    var vname = String(vn || "").toLowerCase();
+                    if (vname === "all") vname = "master";
+                    visualCues.set(vname, vfx);
+                });
+                seedDefaultVisuals();
                 var defs = d.loops || {};
                 Object.keys(defs).forEach(function (lid) {
                     var def = defs[lid];
@@ -1543,7 +1786,9 @@
                 /* a song that was playing resumes its arrangement from the top */
                 if (d.song && d.song.playing) song = { def: d.song, startStep: -1, curSection: null };
             })
-            .catch(function () {});
+            .catch(function () {
+                if (String(curChat) === String(chatId)) seedDefaultVisuals();
+            });
     }
 
     function handleFrame(data) {
@@ -1561,13 +1806,25 @@
         else if (t === "music_sequencer:stop_all") panicAudio();
         else if (t === "music_sequencer:tempo") setTempo(data.bpm);
         else if (t === "music_sequencer:meter") setMeter(data.steps);
+        else if (t === "music_sequencer:visual_clear") {
+            visualCues.clear();
+            seedDefaultVisuals();
+            if (window.MusicSequencerShaderFx && window.MusicSequencerShaderFx.clearAmbient) {
+                window.MusicSequencerShaderFx.clearAmbient();
+            }
+            ambientDirty = true;
+        }
         else if (t === "music_sequencer:sound") {
             if (data.spec) sounds.set(String(data.name), data.spec);
             else sounds.delete(String(data.name));
         }
         else if (t === "music_sequencer:visual") {
-            if (data.effect) visualCues.set(String(data.sound), String(data.effect));
-            else visualCues.delete(String(data.sound));
+            var sfx = data.effect ? String(data.effect) : null;
+            var sv = String(data.sound || "");
+            if (sfx && sv === "all") sv = "master";
+            if (sfx) visualCues.set(sv, sfx);
+            else visualCues.delete(sv);
+            ambientDirty = true;
         }
         else if (t === "music_sequencer:song") {
             panicAudio();
@@ -1602,8 +1859,7 @@
         else curChat = null;
     }
 
-    visualCues.set("kick", "flash");
-    visualCues.set("snare", "ripple");
+    seedDefaultVisuals();
 
     hookWs();
     boot(30);
