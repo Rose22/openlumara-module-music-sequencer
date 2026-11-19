@@ -1,6 +1,8 @@
 (function () {
     var MAX_LAYERS = 60;
-    var STEPS_PER_BAR = 16;
+    /* bar width for loop-start quantization; each loop keeps its own authored
+       steps_per_bar for its repeating span, so mixed-meter layers coexist */
+    var stepsPerBar = 16;
     var LOOKAHEAD = 0.15;
     var TICK_MS = 25;
 
@@ -30,7 +32,7 @@
     function sps() { return 60 / bpm / 4; }
     function absStep(t) { return anchorS + (t - anchorT) / sps(); }
     function stepTime(s) { return anchorT + (s - anchorS) * sps(); }
-    function nextBarStart() { return Math.ceil(absStep(ctx.currentTime) / STEPS_PER_BAR) * STEPS_PER_BAR; }
+    function nextBarStart() { return Math.ceil(absStep(ctx.currentTime) / stepsPerBar) * stepsPerBar; }
     /* the "song" is the cycle of the longest playing loop; a new loop joins on
        that loop's next restart, so its phrasing lands on the song's cycle
        start instead of an arbitrary bar line mid-cycle. falls back to the next
@@ -42,7 +44,7 @@
         var bestTarget = -1;
         loops.forEach(function (l) {
             if (!l.playing || !l.def || l.nextStep < 0) return;
-            var span = (l.def.bar_length || 1) * STEPS_PER_BAR;
+            var span = (l.def.bar_length || 1) * (l.def.steps_per_bar || 16);
             var t = l.nextStep;
             while (t < nowStep) t += span;
             if (span > bestSpan || (span === bestSpan && t < bestTarget)) { bestSpan = span; bestTarget = t; }
@@ -1147,8 +1149,7 @@
                 var whenN = stepTime(startStep + n.start);
                 var durN = Math.max(0.05, n.length * sps());
                 noteHit(d.instrument, n.pitch, whenN, durN, n.velocity * loop.volume);
-                var cue = n.visual || cueN;
-                if (cue) vizQueue.push({ loop: loop, t: whenN, effect: cue, midi: n.pitch, color: noteColor, dur: durN, vel: n.velocity, src: d.id ? String(d.id) : null });
+                if (cueN) vizQueue.push({ loop: loop, t: whenN, effect: cueN, midi: n.pitch, color: noteColor, dur: durN, vel: n.velocity, src: d.id ? String(d.id) : null });
             }
         }
     }
@@ -1159,7 +1160,7 @@
         var horizonStep = absStep(ctx.currentTime + LOOKAHEAD);
         loops.forEach(function (loop) {
             if (!loop.playing || loop.nextStep < 0 || !loop.def) return;
-            var span = (loop.def.bar_length || 1) * STEPS_PER_BAR;
+            var span = (loop.def.bar_length || 1) * (loop.def.steps_per_bar || 16);
             // clock stalled (hidden tab, long tempo jump): fast-forward whole
             // occurrences so the loop resumes exactly on its own phase
             while (loop.nextStep < nowStep) loop.nextStep += span;
@@ -1239,6 +1240,15 @@
         if (master) master.gain.value = masterVolume / 100;
     }
 
+    /* transport bar width for loop-start quantization only; already-scheduled
+       loops repeat on their own authored steps_per_bar and never shift */
+    function setMeter(steps) {
+        var v = Math.round(Number(steps));
+        if (isNaN(v) || v < 1 || v > 128) return false;
+        stepsPerBar = v;
+        return true;
+    }
+
     window.MusicSequencer = {
         play: play,
         stop: stop,
@@ -1307,6 +1317,8 @@
         },
         setTempo: setTempo,
         getTempo: function () { return bpm; },
+        setMeter: setMeter,
+        getMeter: function () { return stepsPerBar; },
         setMasterVolume: setMasterVolume,
         list: function () {
             var out = [];
@@ -1316,6 +1328,7 @@
                     kind: e.def ? e.def.kind : null,
                     voice_or_instrument: e.def ? (e.def.voice || e.def.instrument) : null,
                     bar_length: e.def ? e.def.bar_length : null,
+                    steps_per_bar: e.def ? (e.def.steps_per_bar || 16) : null,
                     playing: !!e.playing
                 });
             });
@@ -1349,6 +1362,7 @@
                 if (!d || String(curChat) !== String(chatId)) return;
                 setMasterVolume(d.master_volume);
                 if (d.tempo) setTempo(d.tempo);
+                if (d.meter) setMeter(d.meter);
                 var sd = d.sounds || {};
                 Object.keys(sd).forEach(function (sn) { sounds.set(sn, sd[sn]); });
                 var vc = d.visuals || {};
@@ -1383,6 +1397,7 @@
         else if (t === "music_sequencer:stop") stop(data.id);
         else if (t === "music_sequencer:stop_all") stopAll();
         else if (t === "music_sequencer:tempo") setTempo(data.bpm);
+        else if (t === "music_sequencer:meter") setMeter(data.steps);
         else if (t === "music_sequencer:sound") {
             if (data.spec) sounds.set(String(data.name), data.spec);
             else sounds.delete(String(data.name));

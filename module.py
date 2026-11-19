@@ -20,6 +20,54 @@ SOUND_NAME_RE = re.compile(r"^[a-z][a-z0-9_\-]{0,31}$")
 
 PITCH_RE = re.compile(r"^([A-Ga-g])([#b]?)(-?\d{1,2})$")
 NOTE_NAMES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+# lowercase [#b] prefix keeps altered degrees ('b7') distinct from note names ('Bb3').
+DEGREE_RE = re.compile(r"^([#b]?)(-?\d{1,2})$")
+KEY_RE = re.compile(r"^([A-Ga-g])([#b]?)(\d{1,2})?\s+(.+)$")
+METER_RE = re.compile(r"^(\d{1,2})\s*/\s*(\d{1,2})$")
+SHARP_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+SCALES = {
+    "major": [0, 2, 4, 5, 7, 9, 11],
+    "minor": [0, 2, 3, 5, 7, 8, 10],
+    "harmonic minor": [0, 2, 3, 5, 7, 8, 11],
+    "melodic minor": [0, 2, 3, 5, 7, 9, 11],
+    "harmonic major": [0, 2, 4, 5, 7, 8, 11],
+    "major pentatonic": [0, 2, 4, 7, 9],
+    "minor pentatonic": [0, 3, 5, 7, 10],
+    "blues": [0, 3, 5, 6, 7, 10],
+    "whole tone": [0, 2, 4, 6, 8, 10],
+    "hirajoshi": [0, 2, 3, 7, 8],
+    "octatonic": [0, 2, 3, 5, 6, 8, 9, 11],
+}
+# Named modes derived from the parent scales by rotation (phrygian dominant,
+# lydian dominant, altered, ...). Rotations identical to the parent (whole tone)
+# register nothing extra.
+MODE_NAMES = {
+    "major": ["dorian", "phrygian", "lydian", "mixolydian", "aeolian", "locrian"],
+    "harmonic minor": ["locrian natural 6", "ionian augmented", "ukrainian dorian",
+                       "phrygian dominant", "lydian sharp 2", "altered dominant"],
+    "melodic minor": ["dorian b2", "lydian augmented", "lydian dominant",
+                      "mixolydian b6", "locrian sharp 2", "altered"],
+}
+for _base, _mode_names in MODE_NAMES.items():
+    _parent = SCALES[_base]
+    for _k, _mode_name in enumerate(_mode_names, start=1):
+        _rotated = _parent[_k:] + [x + 12 for x in _parent[:_k]]
+        _rotated = [x - _rotated[0] for x in _rotated]
+        if _rotated != _parent:
+            SCALES[_mode_name] = _rotated
+SCALE_ALIASES = {
+    "ionian": "major",
+    "natural minor": "minor",
+    "blues scale": "blues",
+    "jazz minor": "melodic minor",
+    "super locrian": "altered",
+    "ultralocrian": "altered dominant",
+    "hijaz": "phrygian dominant",
+    "dorian sharp 4": "ukrainian dorian",
+    "locrian sharp 9": "locrian sharp 2",
+    "ionian sharp 5": "ionian augmented",
+}
 
 
 def _midi_value(pitch):
@@ -257,16 +305,75 @@ def _velocity(value, default):
     return max(0.0, min(1.0, v))
 
 
+def _step_velocity(ch):
+    """Velocity of one drum bar-string character; None when invalid."""
+    if ch in (".", "-", " "):
+        return 0.0
+    if ch in ("x", "X"):
+        return 1.0
+    if "1" <= ch <= "9":
+        return int(ch) / 9.0
+    return None
+
+
+def _parse_meter(signature):
+    """Parse 'N/M' into (steps_per_bar, normalized, error) on the 16th-note grid."""
+    m = METER_RE.match(str(signature or "").strip())
+    if not m:
+        return None, "", "signature must look like '3/4', '6/8' or '7/16'."
+    num, den = int(m.group(1)), int(m.group(2))
+    if den not in (1, 2, 4, 8, 16):
+        return None, "", "Denominator must be 1, 2, 4, 8 or 16."
+    if num < 1 or num > 32:
+        return None, "", "Numerator must be between 1 and 32."
+    return num * (16 // den), f"{num}/{den}", None
+
+def _parse_key(key):
+    """Parse 'root + scale' (e.g. 'A minor', 'F#3 dorian') into (root_midi, scale, scale_name, error)."""
+    raw = str(key or "").strip()
+    if not raw:
+        raw = "C major"
+    m = KEY_RE.match(raw)
+    if not m:
+        return None, None, "", "key must be a root note plus a scale name, e.g. 'A minor', 'F# dorian', 'C3 major pentatonic'."
+    name = re.sub(r"[\s_-]+", " ", m.group(4).strip().lower())
+    name = SCALE_ALIASES.get(name, name)
+    scale = SCALES.get(name)
+    if scale is None:
+        return None, None, "", f"Unknown scale '{m.group(4)}'. Options: {', '.join(sorted(SCALES))}."
+    octave = int(m.group(3)) if m.group(3) else 4
+    if octave < 0 or octave > 8:
+        return None, None, "", "Root octave in key must be between 0 and 8."
+    accidental = 1 if m.group(2) == "#" else (-1 if m.group(2) == "b" else 0)
+    root = (octave + 1) * 12 + NOTE_NAMES[m.group(1).upper()] + accidental
+    return root, scale, name, None
+
+
+def _resolve_pitch(value, root_midi, scale):
+    """Scale degree (int, or '#4'/'b7' string) or absolute note name to a MIDI number; None when invalid."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        octave, idx = divmod(value - 1, len(scale))
+        return root_midi + octave * 12 + scale[idx]
+    m = DEGREE_RE.match(str(value).strip())
+    if m:
+        octave, idx = divmod(int(m.group(2)) - 1, len(scale))
+        alteration = 1 if m.group(1) == "#" else (-1 if m.group(1) == "b" else 0)
+        return root_midi + octave * 12 + scale[idx] + alteration
+    return _midi_value(value)
+
 class MusicSequencerModule(core.module.Module):
     """
     Runs a synced multi-layer loop engine in the user's browser (Web Audio).
-    Launch drum step-sequencer patterns and piano-roll patterns as loop layers
-    (up to 60 at once) on one shared transport grid: every loop quantizes its
-    launch to the next bar and repeats over its own bar length, so 2-bar loops
-    cycle exactly twice per 4-bar loop. Loops keep playing while you chat;
-    control them later by their loop IDs (stop/start), or retune the shared
-    tempo for everything at once. define_sound designs brand-new synth voices
-    from oscillator/noise/filter/envelope recipes, usable as any other.
+    Launch drum patterns (compact bar strings) and melody loops (scale-degree
+    piano rolls over a per-loop key, e.g. 'A minor') as layers (up to 60 at
+    once) on one shared transport grid: every loop quantizes its launch to the
+    next bar and repeats over its own bar length, so 2-bar loops cycle exactly
+    twice per 4-bar loop. Loops keep playing while you chat; control them
+    later by their loop IDs (stop/start), or retune the shared tempo for
+    everything at once. define_sound designs brand-new synth voices from
+    oscillator/noise/filter/envelope recipes, usable as any other.
     Beat-synced chat visuals render through a GLSL/WebGL overlay when the
     browser supports it, falling back to DOM pulses otherwise.
     """
@@ -292,6 +399,8 @@ class MusicSequencerModule(core.module.Module):
             self.data["loops"] = {}
         if "tempo" not in self.data:
             self.data["tempo"] = {}
+        if "meter" not in self.data:
+            self.data["meter"] = {}
         if "next_id" not in self.data:
             self.data["next_id"] = 1
         if "sounds" not in self.data:
@@ -341,6 +450,13 @@ class MusicSequencerModule(core.module.Module):
             bpm = 120
         return max(MIN_TEMPO, min(MAX_TEMPO, bpm))
 
+    def _meter(self, chat_id):
+        steps, _, _ = _parse_meter(self.data.get("meter", {}).get(str(chat_id), "4/4"))
+        return steps if steps else 16
+
+    def _meter_name(self, chat_id):
+        return self.data.get("meter", {}).get(str(chat_id), "4/4")
+
     async def _push(self, chat_id, frame):
         ws = getattr(getattr(self, "channel", None), "websocket_manager", None)
         if not ws or not chat_id:
@@ -369,15 +485,14 @@ class MusicSequencerModule(core.module.Module):
         """
         Launches a drum loop layer on the shared transport, joining at the next
         restart of the longest playing loop (the "song cycle"), so it lands
-        aligned with the song rather than mid-phrase. Each step is one 16th
-        note (4 per beat, 16 per bar).
+        aligned with the song rather than mid-phrase. Patterns use compact bar
+        strings: one character per 16th note, each string exactly one bar of
+        the chat's current meter (16 characters in 4/4; see set_time_signature).
         All loops share one grid and tempo, so any bar lengths stay in sync:
         a 2-bar loop cycles twice while a 4-bar loop plays once.
-        Steps are velocities 0.0-1.0 (0 = silent). Pass either 16 steps (repeats
-        every bar) or bar_length*16 steps (one pattern spanning the whole loop).
 
         Args:
-            steps: Velocity per 16th-note step, e.g. [1,0,0,0, 0.6,0,0,0, 1,0,0,0, 0.6,0,0,0]
+            steps: Bar string(s): digits 1-9 set the hit velocity (9 = full), x = 1.0, '.'/'-'/space = rest. Pass 1 string (repeats every bar) or bar_length strings (one per bar). E.g. ["x...x...x...x...", "x...x...x...5..x"] for 2 bars, or "x..5x...x..5x..." for one.
             bar_length: Length of the loop in bars (1-32). The pattern repeats every bar_length bars.
             voice: Drum voice: kick, snare, clap, hihat_closed, hihat_open, tom, rim, cowbell, or any custom sound name from define_sound.
             volume: Layer volume 0.0-1.0.
@@ -395,15 +510,27 @@ class MusicSequencerModule(core.module.Module):
             return self.result("bar_length must be an integer.", success=False)
         if bars < 1 or bars > MAX_BAR_LENGTH:
             return self.result(f"bar_length must be between 1 and {MAX_BAR_LENGTH}.", success=False)
+        if isinstance(steps, str):
+            steps = [steps]
         if not isinstance(steps, list) or not steps:
-            return self.result("steps must be a non-empty list of velocities.", success=False)
-        if len(steps) not in (16, bars * 16):
-            return self.result(f"steps must have 16 entries (one bar) or {bars * 16} entries (the full loop).", success=False)
+            return self.result("steps must be a bar string, or a list of bar strings.", success=False)
+        if len(steps) not in (1, bars):
+            return self.result(f"steps must be 1 bar string (repeats every bar) or {bars} bar strings (one per bar).", success=False)
         if self._playing_count(chat_id) >= MAX_LAYERS:
             return self.result(f"Cannot start: {MAX_LAYERS} layers are already playing. Stop one first.", success=False)
 
-        pattern = [_velocity(s, 0.0) for s in steps]
-        if len(pattern) == 16 and bars > 1:
+        spb = self._meter(chat_id)
+        pattern = []
+        for i, bar in enumerate(steps):
+            bar = str(bar)
+            if len(bar) != spb:
+                return self.result(f"Bar string {i} is {len(bar)} characters; every bar must be exactly {spb} (the current meter, {self._meter_name(chat_id)}).", success=False)
+            for ch in bar:
+                v = _step_velocity(ch)
+                if v is None:
+                    return self.result(f"Bar string {i} has invalid character {ch!r}; use 1-9, x, '.' or '-'.", success=False)
+                pattern.append(v)
+        if len(pattern) == spb and bars > 1:
             pattern = pattern * bars
 
         loop_id = self._next_loop_id()
@@ -411,6 +538,7 @@ class MusicSequencerModule(core.module.Module):
             "kind": "drum",
             "voice": voice,
             "bar_length": bars,
+            "steps_per_bar": spb,
             "steps": pattern,
             "volume": _velocity(volume, 1.0),
             "playing": True,
@@ -426,21 +554,21 @@ class MusicSequencerModule(core.module.Module):
         )
 
     @core.module.tool
-    async def play_note_pattern(self, notes: list, bar_length: int = 1, instrument: str = "piano", volume: float = 1.0):
+    async def play_note_pattern(self, notes: list, bar_length: int = 1, instrument: str = "piano", volume: float = 1.0, key: str = "C major"):
         """
         Launches a piano-roll style melody loop layer on the shared transport,
         joining at the next restart of the longest playing loop (the "song
         cycle"), so its phrasing stays aligned with the rest of the song.
-        All loops share one grid and tempo,
-        so any bar lengths stay in sync. Pitches are MIDI note numbers (60 =
-        middle C) or note names ("C4", "F#5", "Bb2"). Timing is in 16th-note
-        steps: 16 steps per bar, so a 4-bar loop has steps 0-63.
+        All loops share one grid and tempo, so any bar lengths stay in sync.
+        Timing is in 16th-note steps: one bar holds the chat meter's steps
+        (16 in 4/4, so a 4-bar loop spans steps 0-63).
 
         Args:
-            notes: List of note dicts, each {pitch, start, length, velocity?, visual?}. visual is a one-off chat-window effect for that note (flash|bloom|spark|tick|laser|ripple|wave|plasma|aurora|prism|strobe). E.g. [{"pitch": "C4", "start": 0, "length": 8}, {"pitch": 67, "start": 8, "length": 4, "velocity": 0.7, "visual": "bloom"}]
+            notes: List of notes as short lists: [pitch, start, length?, velocity?]. Write pitches as SCALE DEGREES (the default way to compose here): 1 = tonic of the key, 2-7 the following degrees, 8 = tonic an octave up, 0 = one octave down, wrapping over any scale length (degree 6 in a pentatonic = octave tonic); '#4'/'b7' alter a degree chromatically. Always use degrees unless a deliberately off-scale riff is wanted - absolute note names ('C4', 'F#5', 'Bb2') are accepted for those (note: a lowercase '#'/'b' prefix makes it a degree, so 'b7' = flat seventh degree while 'Bb3' = a note). start/length are 16th-note steps (length defaults to 4); velocity 0.0-1.0 (default 0.8). Visual cues are bound per instrument with set_visual, not per note. E.g. over key="A minor": [["1", 0, 8], ["3", 8], ["5", 12, 4, 0.7]] plays A C E.
             bar_length: Length of the loop in bars (1-32). The roll repeats every bar_length bars.
             instrument: Timbre: piano, bass, pad, lead, pluck, bells, sine, square, triangle, saw, organ, strings, synbrass, flute, musicbox, or any custom sound name from define_sound.
             volume: Layer volume 0.0-1.0.
+            key: Scale of the loop as root note + scale name; the root may carry an octave (default 4). E.g. "A minor", "F# dorian", "C3 major pentatonic". Common: major, minor, harmonic/melodic minor, harmonic major, dorian, phrygian, lydian, mixolydian, locrian, whole tone, hirajoshi, octatonic, major/minor pentatonic, blues - plus every derived mode (phrygian dominant, lydian dominant, altered, ukrainian dorian, ...). An invalid name returns the full list of options.
         """
         chat_id = self._chat_id()
         if not chat_id:
@@ -456,48 +584,47 @@ class MusicSequencerModule(core.module.Module):
         if bars < 1 or bars > MAX_BAR_LENGTH:
             return self.result(f"bar_length must be between 1 and {MAX_BAR_LENGTH}.", success=False)
         if not isinstance(notes, list) or not notes:
-            return self.result("notes must be a non-empty list of note dicts.", success=False)
+            return self.result("notes must be a non-empty list of [pitch, start, length?, velocity?] lists.", success=False)
         if len(notes) > 512:
             return self.result("Too many notes (max 512 per loop).", success=False)
         if self._playing_count(chat_id) >= MAX_LAYERS:
             return self.result(f"Cannot start: {MAX_LAYERS} layers are already playing. Stop one first.", success=False)
+        root_midi, scale, scale_name, key_err = _parse_key(key)
+        if key_err:
+            return self.result(key_err, success=False)
 
-        grid = bars * 16
+        spb = self._meter(chat_id)
+        grid = bars * spb
         clean_notes = []
         for i, n in enumerate(notes):
-            if not isinstance(n, dict):
-                return self.result(f"Note {i} is not a dict with pitch/start/length.", success=False)
-            pitch = n.get("pitch")
-            midi = _midi_value(pitch)
+            if not isinstance(n, list) or len(n) < 2 or len(n) > 4:
+                return self.result(f"Note {i} must be a list: [pitch, start, length?, velocity?].", success=False)
+            midi = _resolve_pitch(n[0], root_midi, scale)
             if midi is None or midi < 12 or midi > 127:
-                return self.result(f"Note {i} has an invalid pitch ({pitch!r}). Use MIDI numbers or names like C4.", success=False)
+                return self.result(f"Note {i} has an invalid pitch ({n[0]!r}). Use a scale degree (1, 3, '#4', 'b7') or a note name like C4.", success=False)
             try:
-                start = int(n.get("start", 0))
-                length = int(n.get("length", 4))
+                start = int(n[1])
+                length = int(n[2]) if len(n) > 2 else 4
             except (TypeError, ValueError):
                 return self.result(f"Note {i} has non-integer start/length.", success=False)
             if start < 0 or start >= grid:
                 return self.result(f"Note {i} starts outside the loop (start must be 0-{grid - 1}).", success=False)
             if length < 1:
                 return self.result(f"Note {i} has length < 1.", success=False)
-            note = {
+            clean_notes.append({
                 "pitch": midi,
                 "start": start,
                 "length": min(length, grid - start),
-                "velocity": _velocity(n.get("velocity"), 0.8),
-            }
-            vis = str(n.get("visual", "")).strip().lower()
-            if vis and vis not in EFFECTS:
-                return self.result(f"Note {i} visual must be one of: {', '.join(EFFECTS)}.", success=False)
-            if vis:
-                note["visual"] = vis
-            clean_notes.append(note)
+                "velocity": _velocity(n[3], 0.8) if len(n) > 3 else 0.8,
+            })
 
         loop_id = self._next_loop_id()
         definition = {
             "kind": "note",
             "instrument": instrument,
             "bar_length": bars,
+            "steps_per_bar": spb,
+            "key": f"{SHARP_NAMES[root_midi % 12]}{root_midi // 12 - 1} {scale_name}",
             "notes": clean_notes,
             "volume": _velocity(volume, 1.0),
             "playing": True,
@@ -612,6 +739,30 @@ class MusicSequencerModule(core.module.Module):
         return self.result(f"Tempo set to {tempo:g} BPM.", success=True)
 
     @core.module.tool
+    async def set_time_signature(self, signature: str):
+        """
+        Sets the chat's meter. New loops author their patterns to it (each loop
+        remembers its own bar length, so playing loops keep feeling unchanged
+        and mixed-meter layers can even coexist on one grid).
+
+        Args:
+            signature: Time signature like '3/4', '6/8', '5/4' or '7/16'. Numerator 1-32; denominator 1, 2, 4, 8 or 16. 4/4 = 16 sixteenth-note steps per bar.
+        """
+        chat_id = self._chat_id()
+        if not chat_id:
+            return self.result("No active chat.", success=False)
+        steps, norm, err = _parse_meter(signature)
+        if err:
+            return self.result(err, success=False)
+        all_meters = dict(self.data.get("meter", {}))
+        all_meters[str(chat_id)] = norm
+        self.data["meter"] = all_meters
+        self.data.save()
+        await self._push(chat_id, {"type": "music_sequencer:meter", "signature": norm, "steps": steps})
+        return self.result(f"Meter set to {norm} ({steps} sixteenth-note steps per bar) for new loops.", success=True)
+
+
+    @core.module.tool
     async def list_loops(self):
         """
         Lists this chat's loop layers: IDs, kind, voice/instrument, bar length,
@@ -628,14 +779,17 @@ class MusicSequencerModule(core.module.Module):
                 "kind": d.get("kind"),
                 "voice_or_instrument": d.get("voice") or d.get("instrument"),
                 "bar_length": d.get("bar_length"),
+                "steps_per_bar": d.get("steps_per_bar", 16),
                 "volume": d.get("volume"),
                 "playing": bool(d.get("playing")),
             }
             if d.get("kind") == "note":
                 entry["note_count"] = len(d.get("notes", []))
+                entry["key"] = d.get("key")
             summary.append(entry)
         return self.result({
             "tempo": self._tempo(chat_id),
+            "meter": self._meter_name(chat_id),
             "layers_playing": self._playing_count(chat_id),
             "max_layers": MAX_LAYERS,
             "loops": summary,
@@ -662,8 +816,9 @@ class MusicSequencerModule(core.module.Module):
         """
         Attaches a chat-window visual cue to a drum voice or instrument: every
         hit of that sound pulses the effect (a whole chord's simultaneous notes
-        merge into one pulse). Defaults: kick->flash, snare->ripple. Notes can
-        also carry a per-note 'visual' key in play_note_pattern for accents.
+        merge into one pulse). This is the only visual binding - loops play
+        whatever cue their voice/instrument currently has. Defaults:
+        kick->flash, snare->ripple.
 
         Args:
             sound: Voice or instrument name (built-in or custom).
@@ -778,7 +933,7 @@ class MusicSequencerModule(core.module.Module):
     async def _route_state(self, body=None, query=None):
         chat_id = (query or {}).get("chat")
         if not chat_id:
-            return {"loops": {}, "sounds": {}, "tempo": self._tempo(chat_id), "master_volume": self.config.get("master_volume", 80)}
+            return {"loops": {}, "sounds": {}, "tempo": self._tempo(chat_id), "meter": self._meter(chat_id), "master_volume": self.config.get("master_volume", 80)}
         loops = {}
         for loop_id, d in self._loops(chat_id).items():
             loops[loop_id] = dict(d, id=loop_id)
@@ -787,6 +942,7 @@ class MusicSequencerModule(core.module.Module):
             "sounds": self._sounds(chat_id),
             "visuals": self._visuals(chat_id),
             "tempo": self._tempo(chat_id),
+            "meter": self._meter(chat_id),
             "master_volume": self.config.get("master_volume", 80),
         }
 
@@ -819,10 +975,12 @@ class MusicSequencerModule(core.module.Module):
         lines = []
         for loop_id, d in loops.items():
             name = d.get("voice") or d.get("instrument")
+            key = f", {d['key']}" if d.get("key") else ""
+            spb = d.get("steps_per_bar", 16)
             state = "playing" if d.get("playing") else "stopped"
-            lines.append(f"- {loop_id}: {d.get('kind')} ({name}, {d.get('bar_length')} bars, vol {d.get('volume')}) - {state}")
+            lines.append(f"- {loop_id}: {d.get('kind')} ({name}{key}, {d.get('bar_length')} bars @ {spb} steps, vol {d.get('volume')}) - {state}")
         block = (
-            f"Active music_sequencer layers (tempo {self._tempo(chat_id):g} BPM):\n"
+            f"Active music_sequencer layers (tempo {self._tempo(chat_id):g} BPM, new-loop meter {self._meter_name(chat_id)}):\n"
             + "\n".join(lines)
         )
         custom = sorted(self._sounds(chat_id))
@@ -847,9 +1005,9 @@ class MusicSequencerModule(core.module.Module):
         loops = self._loops(chat_id)
         if not loops:
             return "No loop layers in this chat. Ask the AI to start one!"
-        lines = [f"Tempo: {self._tempo(chat_id):g} BPM | {self._playing_count(chat_id)}/{MAX_LAYERS} layers playing"]
+        lines = [f"Tempo: {self._tempo(chat_id):g} BPM | Meter (new loops): {self._meter_name(chat_id)} | {self._playing_count(chat_id)}/{MAX_LAYERS} layers playing"]
         for loop_id, d in loops.items():
             name = d.get("voice") or d.get("instrument")
             state = "playing" if d.get("playing") else "stopped"
-            lines.append(f"{loop_id}: {d.get('kind')} ({name}, {d.get('bar_length')} bars) - {state}")
+            lines.append(f"{loop_id}: {d.get('kind')} ({name}, {d.get('bar_length')} bars @ {d.get('steps_per_bar', 16)} steps) - {state}")
         return "\n".join(lines)
