@@ -13,7 +13,8 @@ BUILTIN_NAMES = set(DRUM_VOICES) | set(INSTRUMENTS)
 
 OSC_TYPES = ["sine", "square", "sawtooth", "triangle"]
 WT_TABLES = ["harmonics", "even", "sparse"]
-EFFECTS = ["flash", "ring", "bloom", "spark", "tick", "laser"]
+EFFECTS = ["flash", "bloom", "spark", "tick", "laser", "ripple", "wave", "plasma", "aurora", "prism", "strobe"]
+DEFAULT_VISUALS = {"kick": "flash", "snare": "ripple"}
 FILTER_TYPES = ["lowpass", "highpass", "bandpass"]
 SOUND_NAME_RE = re.compile(r"^[a-z][a-z0-9_\-]{0,31}$")
 
@@ -266,6 +267,8 @@ class MusicSequencerModule(core.module.Module):
     control them later by their loop IDs (stop/start), or retune the shared
     tempo for everything at once. define_sound designs brand-new synth voices
     from oscillator/noise/filter/envelope recipes, usable as any other.
+    Beat-synced chat visuals render through a GLSL/WebGL overlay when the
+    browser supports it, falling back to DOM pulses otherwise.
     """
 
     category = "Music"
@@ -434,7 +437,7 @@ class MusicSequencerModule(core.module.Module):
         steps: 16 steps per bar, so a 4-bar loop has steps 0-63.
 
         Args:
-            notes: List of note dicts, each {pitch, start, length, velocity?, visual?}. visual is a one-off chat-window effect for that note (flash|ring|bloom|spark|tick|laser). E.g. [{"pitch": "C4", "start": 0, "length": 8}, {"pitch": 67, "start": 8, "length": 4, "velocity": 0.7, "visual": "bloom"}]
+            notes: List of note dicts, each {pitch, start, length, velocity?, visual?}. visual is a one-off chat-window effect for that note (flash|bloom|spark|tick|laser|ripple|wave|plasma|aurora|prism|strobe). E.g. [{"pitch": "C4", "start": 0, "length": 8}, {"pitch": 67, "start": 8, "length": 4, "velocity": 0.7, "visual": "bloom"}]
             bar_length: Length of the loop in bars (1-32). The roll repeats every bar_length bars.
             instrument: Timbre: piano, bass, pad, lead, pluck, bells, sine, square, triangle, saw, organ, strings, synbrass, flute, musicbox, or any custom sound name from define_sound.
             volume: Layer volume 0.0-1.0.
@@ -659,12 +662,12 @@ class MusicSequencerModule(core.module.Module):
         """
         Attaches a chat-window visual cue to a drum voice or instrument: every
         hit of that sound pulses the effect (a whole chord's simultaneous notes
-        merge into one pulse). Defaults: kick->flash, snare->ring. Notes can
+        merge into one pulse). Defaults: kick->flash, snare->ripple. Notes can
         also carry a per-note 'visual' key in play_note_pattern for accents.
 
         Args:
             sound: Voice or instrument name (built-in or custom).
-            effect: flash | ring | bloom | spark | tick | laser (spark/tick/laser suit fast short notes; laser fires a beam from the note's grid cell), or 'off' to clear.
+            effect: flash | bloom | spark | tick | laser | ripple | wave | plasma | aurora | prism | strobe (GLSL visuals: ripple/wave/plasma/aurora/prism/strobe; spark/tick/laser suit fast short notes; strobe is intentionally flashy), or 'off' to clear.
         """
         chat_id = self._chat_id()
         if not chat_id:
@@ -681,6 +684,19 @@ class MusicSequencerModule(core.module.Module):
         self._store_visuals(chat_id, visuals)
         await self._push(chat_id, {"type": "music_sequencer:visual", "sound": snd, "effect": None if fx == "off" else fx})
         return self.result(f"{'Cleared' if fx == 'off' else f'{snd} now pulses {fx}'} visual cue.", success=True)
+
+    @core.module.tool
+    async def list_visual_effects(self):
+        """
+        Lists all beat-synced visual effect names, the current per-sound cues,
+        and the built-in defaults.
+        """
+        chat_id = self._chat_id()
+        return self.result({
+            "effects": EFFECTS,
+            "defaults": DEFAULT_VISUALS,
+            "active_cues": self._visuals(chat_id) if chat_id else {},
+        }, success=True)
 
     @core.module.tool
     async def define_sound(self, name: str, spec: dict):

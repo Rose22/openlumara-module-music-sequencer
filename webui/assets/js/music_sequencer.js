@@ -797,6 +797,63 @@
         o.stop(when + hold + rel + 0.05);
     }
 
+        /* lush analog-style pad: three detuned saws + sub-octave sine through a
+       slow lowpass swell, one shared vibrato LFO that fades in, and a quiet
+       FM_PAD layer on top for glassy shimmer. Attack scales with note length
+       so even short notes swell audibly. */
+    function padVoice(freq, when, dur, vel) {
+        var hold = Math.max(0.15, dur);
+        var atk = Math.min(0.45, Math.max(0.10, dur * 0.3));
+        var rel = 0.7;
+        var peak = Math.max(0.0005, vel * 0.5);
+        var amp = ctx.createGain();
+        amp.gain.setValueAtTime(0.0001, when);
+        amp.gain.exponentialRampToValueAtTime(peak, when + atk);
+        amp.gain.setValueAtTime(peak, when + Math.max(atk + 0.01, hold));
+        amp.gain.exponentialRampToValueAtTime(0.0001, when + Math.max(atk + 0.01, hold) + rel);
+        var f = ctx.createBiquadFilter();
+        f.type = "lowpass";
+        f.Q.value = 0.7;
+        f.frequency.setValueAtTime(Math.min(500, Math.max(120, freq * 1.4)), when);
+        f.frequency.exponentialRampToValueAtTime(Math.min(2800, Math.max(600, freq * 4)), when + atk * 1.5);
+        amp.connect(f);
+        f.connect(master);
+        var lfo = ctx.createOscillator();
+        lfo.type = "sine";
+        lfo.frequency.value = 4.6;
+        var lg = ctx.createGain();
+        lg.gain.setValueAtTime(0, when);
+        lg.gain.linearRampToValueAtTime(8, when + 0.9);
+        lfo.connect(lg);
+        lfo.start(when);
+        lfo.stop(when + hold + rel + 0.1);
+        var dets = [-9, 0, 7];
+        var lvls = [0.22, 0.22, 0.19];
+        for (var i = 0; i < 3; i++) {
+            var o = ctx.createOscillator();
+            o.type = "sawtooth";
+            o.frequency.setValueAtTime(freq, when);
+            o.detune.setValueAtTime(dets[i], when);
+            var og = ctx.createGain();
+            og.gain.value = lvls[i];
+            o.connect(og);
+            og.connect(amp);
+            lg.connect(o.detune);
+            o.start(when);
+            o.stop(when + hold + rel + 0.1);
+        }
+        var sub = ctx.createOscillator();
+        sub.type = "sine";
+        sub.frequency.setValueAtTime(freq / 2, when);
+        var sg = ctx.createGain();
+        sg.gain.value = 0.28;
+        sub.connect(sg);
+        sg.connect(amp);
+        sub.start(when);
+        sub.stop(when + hold + rel + 0.1);
+        fmHit(FM_PAD, freq, when, vel * 0.18, hold);
+    }
+
     function noteHit(kind, midi, when, dur, vel) {
         var f = midiToFreq(midi);
         var custom = sounds.get(String(kind));
@@ -827,9 +884,7 @@
                 sustainVoice("sawtooth", f * 1.005, when, dur, vel * 0.1, 0.01, 0.06, 3200, { rate: 5.8, depth: 8, delay: 0.25 });
                 break;
             case "pad":
-                fmHit(FM_PAD, f * 1.003, when, vel * 0.55, dur);
-                fmHit(FM_PAD, f * 0.997, when, vel * 0.55, dur);
-                sustainVoice("sine", f, when, dur, vel * 0.06, Math.min(dur * 0.5, 0.5), 0.4, 0, { rate: 4.4, depth: 5, delay: 0.6 });
+                padVoice(f, when, dur, vel);
                 break;
             case "bells":
                 pluckVoice("sine", f, when, Math.max(dur, 1.2), vel * 0.4);
@@ -887,9 +942,17 @@
         if (!host) return null;
         if (getComputedStyle(host).position === "static") host.style.position = "relative";
         if (!vizEl || vizEl.parentElement !== host) {
-            vizEl = document.createElement("div");
-            vizEl.className = "msq-viz";
-            host.appendChild(vizEl);
+            var layers = host.querySelectorAll(".msq-viz");
+            if (layers.length) {
+                vizEl = layers[layers.length - 1];
+                for (var i = 0; i < layers.length - 1; i++) {
+                    if (layers[i] !== vizEl && layers[i].parentElement === host) host.removeChild(layers[i]);
+                }
+            } else {
+                vizEl = document.createElement("div");
+                vizEl.className = "msq-viz";
+                host.appendChild(vizEl);
+            }
         }
         return vizEl;
     }
@@ -917,7 +980,23 @@
         synbrass: "#f4845f",
         flute: "#e0f7fa",
         musicbox: "#fcd5ce",
-        fm: "#7209b7"
+        fm: "#7209b7",
+        /* drum voices */
+        kick: "#ff4d6d",
+        snare: "#f4a261",
+        clap: "#ffd166",
+        hihat_closed: "#caf0f8",
+        hihat_open: "#90e0ef",
+        tom: "#b08968",
+        rim: "#ede0d4",
+        cowbell: "#ffe066",
+        /* custom sounds palette (trance set) */
+        trancepad: "#2ee6c8",
+        wtlead: "#ff5da2",
+        supersaw: "#ff9e40",
+        acid: "#c6ff3f",
+        chime: "#bfefff",
+        riser: "#c77dff"
     };
     function colorFor(name) { return INSTRUMENT_COLORS[String(name)] || null; }
     function pitchToCell(midi) {
@@ -960,7 +1039,6 @@
         var cy = (cell ? cell.y : 50) / 100 * h;
         var x0 = Math.random() < 0.5 ? 0 : w;
         var dx = cx - x0, dy = cy;
-        var dist = Math.sqrt(dx * dx + dy * dy) || 1;
         var ang = Math.atan2(dy, dx) + (Math.random() * 2 - 1) * (Math.PI / 12);
         // full diagonal always outruns any in-screen ray from a corner, so
         // every beam is guaranteed to cross a page edge regardless of jitter
@@ -988,18 +1066,31 @@
         }, 1200);
     }
 
-    function fireViz(effect, midi, color, dur) {
+    var SHADER_DOM_FALLBACK = {
+        ripple: "bloom",
+        wave: "tick",
+        plasma: "bloom",
+        aurora: "bloom",
+        prism: "laser",
+        strobe: "flash"
+    };
+
+    function fireViz(effect, midi, color, dur, vel, source) {
         if (!effect) return;
+        try {
+            if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+        } catch (e) {}
         var cell = midi != null ? pitchToCell(midi) : null;
-        if (effect === "spark") { spawnPulse("msq-spark-dot", cell ? cell.x : 50, cell ? cell.y : 62, color); return; }
-        if (effect === "tick") { spawnPulse("msq-tick-bar", cell ? cell.x : 50, 0, color); return; }
-        if (effect === "laser") { fireLaser(cell, color); return; }
-        if (effect === "flash") { spawnPulse("msq-flash-full", null, null, color); return; }
-        if (effect === "ring") { spawnPulse("msq-ring-el", null, null, color); return; }
-        if (effect === "bloom") {
-            /* two-part stage flare on the note's grid cell, lifetime synced
-               to the sounding note (250ms floor so very short notes still
-               read as a flash) */
+        if (window.MusicSequencerShaderFx && window.MusicSequencerShaderFx.trigger(effect, cell, color, dur, vel, source)) return;
+
+        var fallback = SHADER_DOM_FALLBACK[effect] || effect;
+        if (fallback === "spark") { spawnPulse("msq-spark-dot", cell ? cell.x : 50, cell ? cell.y : 62, color); return; }
+        if (fallback === "tick") { spawnPulse("msq-tick-bar", cell ? cell.x : 50, 0, color); return; }
+        if (fallback === "laser") { fireLaser(cell, color); return; }
+        if (fallback === "flash") { spawnPulse("msq-flash-full", null, null, color); return; }
+        if (fallback === "bloom") {
+            /* DOM fallback only: WebGL is unavailable. Two-part stage flare on
+               the note's grid cell, lifetime synced to the sounding note. */
             var bl = Math.max(0.25, dur || 0.5);
             var bx = cell ? cell.x : 50, by = cell ? cell.y : 50;
             var rays = spawnPulse("msq-bloom-rays", bx, by, color, bl * 1.3);
@@ -1019,16 +1110,18 @@
        rAF against ctx.currentTime, never by drifting wall-clock timers. */
     function pumpViz() {
         requestAnimationFrame(pumpViz);
-        if (!ctx || !vizQueue.length) return;
-        var now = ctx.currentTime - VIZ_LEAD;
-        var keep = [];
-        for (var i = 0; i < vizQueue.length; i++) {
-            var e = vizQueue[i];
-            if (e.t > now) { keep.push(e); continue; }
-            if (now - e.t > 0.25) continue;
-            fireViz(e.effect, e.midi, e.color, e.dur);
+        if (ctx && vizQueue.length) {
+            var now = ctx.currentTime - VIZ_LEAD;
+            var keep = [];
+            for (var i = 0; i < vizQueue.length; i++) {
+                var e = vizQueue[i];
+                if (e.t > now) { keep.push(e); continue; }
+                if (now - e.t > 0.25) continue;
+                fireViz(e.effect, e.midi, e.color, e.dur, e.vel, e.src);
+            }
+            vizQueue = keep;
         }
-        vizQueue = keep;
+        if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.render();
     }
     requestAnimationFrame(pumpViz);
 
@@ -1042,7 +1135,7 @@
                 if (steps[i] > 0) {
                     var when = stepTime(startStep + i);
                     drumHit(d.voice, when, steps[i] * loop.volume);
-                    if (cue) vizQueue.push({ loop: loop, t: when, effect: cue, midi: null });
+                    if (cue) vizQueue.push({ loop: loop, t: when, effect: cue, midi: null, color: colorFor(d.voice), vel: steps[i], src: d.id ? String(d.id) : null });
                 }
             }
         } else if (d.kind === "note") {
@@ -1055,7 +1148,7 @@
                 var durN = Math.max(0.05, n.length * sps());
                 noteHit(d.instrument, n.pitch, whenN, durN, n.velocity * loop.volume);
                 var cue = n.visual || cueN;
-                if (cue) vizQueue.push({ loop: loop, t: whenN, effect: cue, midi: n.pitch, color: noteColor, dur: durN });
+                if (cue) vizQueue.push({ loop: loop, t: whenN, effect: cue, midi: n.pitch, color: noteColor, dur: durN, vel: n.velocity, src: d.id ? String(d.id) : null });
             }
         }
     }
@@ -1087,6 +1180,7 @@
         id = String(id || def.id || ("local_" + (++localSeq)));
         var existing = loops.get(id);
         if (!existing && countPlaying() >= MAX_LAYERS) return null;
+        def.id = id;
         loops.set(id, {
             def: def,
             volume: clamp01(def.volume == null ? 1 : def.volume),
@@ -1097,11 +1191,13 @@
     }
 
     function stop(id) {
-        var e = loops.get(String(id));
+        id = String(id);
+        var e = loops.get(id);
         if (!e) return false;
         e.playing = false;
         e.nextStep = -1;
         vizQueue = vizQueue.filter(function (v) { return v.loop !== e; });
+        if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.remove(id);
         return true;
     }
 
@@ -1118,6 +1214,7 @@
     function stopAll() {
         loops.forEach(function (e) { e.playing = false; e.nextStep = -1; });
         vizQueue = [];
+        if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.clear();
     }
 
     function setTempo(newBpm) {
@@ -1151,9 +1248,24 @@
             var e = loops.get(id);
             if (e) vizQueue = vizQueue.filter(function (v) { return v.loop !== e; });
             loops.delete(id);
+            if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.remove(id);
         },
         stopAll: stopAll,
-        testVisual: function (effect) { fireViz(String(effect || "flash")); },
+        testVisual: function (effect) { fireViz(String(effect || "flash"), null, null, 0.65, 1); },
+        shaderDiag: function () {
+            return window.MusicSequencerShaderFx
+                ? window.MusicSequencerShaderFx.diag()
+                : { ready: false, supported: false, enabled: false, activeEvents: 0, error: "shader asset not loaded" };
+        },
+        setShaderEnabled: function (on) {
+            return window.MusicSequencerShaderFx ? window.MusicSequencerShaderFx.setEnabled(on) : false;
+        },
+        setShaderFogEnabled: function (on) {
+            return window.MusicSequencerShaderFx ? window.MusicSequencerShaderFx.setFogEnabled(on) : false;
+        },
+        setShaderFogIntensity: function (value) {
+            return window.MusicSequencerShaderFx ? window.MusicSequencerShaderFx.setFogIntensity(value) : 0;
+        },
         vizDiag: function () {
             var host = document.getElementById("chat-window") || document.getElementById("messages");
             var st = vizEl ? getComputedStyle(vizEl) : null;
@@ -1189,6 +1301,10 @@
             sounds.forEach(function (spec, name) { out.push({ name: name, spec: spec }); });
             return out;
         },
+        getAudioTime: function () {
+            if (ctx && ctx.state === "running") return ctx.currentTime;
+            return window.performance ? performance.now() / 1000 : Date.now() / 1000;
+        },
         setTempo: setTempo,
         getTempo: function () { return bpm; },
         setMasterVolume: setMasterVolume,
@@ -1222,6 +1338,7 @@
         loops.clear();
         sounds.clear();
         vizQueue = [];
+        if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.clear();
         if (typeof simpleApiFetch !== "function") {
             setTimeout(function () { loadChat(chatId); }, 300);
             return;
@@ -1300,8 +1417,9 @@
     }
 
     visualCues.set("kick", "flash");
-    visualCues.set("snare", "ring");
+    visualCues.set("snare", "ripple");
 
     hookWs();
     boot(30);
+    if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.ensure();
 })();
