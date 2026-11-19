@@ -1,0 +1,290 @@
+.msq-viz {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 5;
+    overflow: hidden;
+}
+
+.msq-flash-full {
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(circle at 50% 60%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 30%, transparent) 0%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 12%, transparent) 55%,
+        transparent 100%);
+    animation: msq-kick-flash 130ms ease-out forwards;
+}
+
+@keyframes msq-kick-flash {
+    0% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 0;
+    }
+}
+
+.msq-ring-el {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 30vmin;
+    height: 30vmin;
+    margin: -15vmin 0 0 -15vmin;
+    border: 3px solid var(--msq-c, var(--accent));
+    border-radius: 50%;
+    animation: msq-ring-out 400ms ease-out forwards;
+}
+
+@keyframes msq-ring-out {
+    0% {
+        transform: scale(0.2);
+        opacity: 0.9;
+    }
+    100% {
+        transform: scale(2.6);
+        opacity: 0;
+    }
+}
+
+.msq-bloom-glow {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 46vmin;
+    height: 46vmin;
+    margin: -23vmin 0 0 -23vmin;
+    /* feather the whole element so its edge can never show, independent of
+       the gradient; content also reaches 0 alpha well before the clip rim */
+    -webkit-mask-image: radial-gradient(circle, black 0%, rgba(0, 0, 0, 0.7) 40%, rgba(0, 0, 0, 0.35) 65%, rgba(0, 0, 0, 0.1) 85%, transparent 100%);
+    mask-image: radial-gradient(circle, black 0%, rgba(0, 0, 0, 0.7) 40%, rgba(0, 0, 0, 0.35) 65%, rgba(0, 0, 0, 0.1) 85%, transparent 100%);
+    /* every stop fades toward in-hue transparency (never the black keyword),
+       so no dark rim creeps in and the halo melts into the page */
+    background: radial-gradient(circle,
+        color-mix(in srgb, white 85%, var(--msq-c, var(--accent))) 0%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 70%, white) 8%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 40%, transparent) 20%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 24%, transparent) 34%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 14%, transparent) 50%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 7%, transparent) 68%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 3%, transparent) 84%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 0%, transparent) 100%);
+    filter: blur(8px);
+    animation: msq-bloom-glow 500ms ease-out forwards;
+}
+
+.msq-bloom-rays {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    /* oversized wheel: spokes outrun the clipped viz layer, so rays read as
+       beams continuing beyond the page edge */
+    width: 260vmax;
+    height: 260vmax;
+    margin: -130vmax 0 0 -130vmax;
+    border-radius: 50%;
+    /* few wide soft spokes, heavily blurred - a suggestion of rays, not a
+       sunburst diagram */
+    background: repeating-conic-gradient(from var(--msq-r0, 0deg),
+        color-mix(in srgb, var(--msq-c, var(--accent)) 45%, transparent) 0deg 3deg,
+        transparent 3deg 30deg);
+    -webkit-mask-image: radial-gradient(circle, transparent 3%, black calc(var(--msq-rl, 45%) * 0.25), transparent var(--msq-rl, 45%));
+    mask-image: radial-gradient(circle, transparent 3%, black calc(var(--msq-rl, 45%) * 0.25), transparent var(--msq-rl, 45%));
+    filter: blur(4px);
+    animation: msq-bloom-rays 650ms ease-out forwards;
+}
+
+@keyframes msq-bloom-glow {
+    0% {
+        transform: scale(0.2);
+        opacity: 1;
+    }
+    25% {
+        transform: scale(1);
+        opacity: 1;
+    }
+    100% {
+        transform: scale(1.4);
+        opacity: 0;
+    }
+}
+
+@keyframes msq-bloom-rays {
+    0% {
+        transform: rotate(var(--msq-r0, 0deg)) scale(0.15);
+        opacity: 0;
+    }
+    12% {
+        opacity: 1;
+    }
+    35% {
+        transform: rotate(calc(var(--msq-r0, 0deg) + 14deg)) scale(1.03);
+    }
+    100% {
+        transform: rotate(calc(var(--msq-r0, 0deg) + 40deg)) scale(1.12);
+        opacity: 0;
+    }
+}
+
+.msq-spark-dot {
+    position: absolute;
+    top: 50%;
+    width: 10px;
+    height: 10px;
+    margin: -5px 0 0 -5px;
+    border-radius: 3px;
+    background: color-mix(in srgb, var(--msq-c, var(--accent)) 40%, white);
+    box-shadow: 0 0 10px 3px color-mix(in srgb, var(--msq-c, var(--accent)) 80%, transparent);
+    animation: msq-spark-pop 240ms ease-out forwards;
+}
+
+.msq-spark-dot::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 16vmin;
+    height: 16vmin;
+    margin: -8vmin 0 0 -8vmin;
+    border-radius: 50%;
+    background: radial-gradient(circle,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 65%, transparent) 0%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 25%, transparent) 40%,
+        transparent 70%);
+    animation: msq-spark-bloom 240ms ease-out forwards;
+}
+
+@keyframes msq-spark-pop {
+    0% {
+        transform: scale(1.4);
+        opacity: 1;
+    }
+    55% {
+        opacity: 1;
+    }
+    100% {
+        transform: scale(0.6);
+        opacity: 0;
+    }
+}
+
+@keyframes msq-spark-bloom {
+    0% {
+        transform: scale(0.12);
+        opacity: 1;
+    }
+    100% {
+        transform: scale(1.1);
+        opacity: 0;
+    }
+}
+
+.msq-tick-bar {
+    position: absolute;
+    top: 0;
+    width: 4px;
+    height: 28px;
+    margin: 0 0 0 -2px;
+    border-radius: 0 0 2px 2px;
+    transform-origin: center top;
+    background: linear-gradient(to bottom,
+        var(--msq-c, var(--accent)) 0%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 40%, transparent) 60%,
+        transparent 100%);
+    animation: msq-tick-drop 150ms ease-out forwards;
+}
+
+@keyframes msq-tick-drop {
+    0% {
+        transform: scaleY(0.35);
+        opacity: 1;
+    }
+    100% {
+        transform: scaleY(1.15);
+        opacity: 0;
+    }
+}
+
+.msq-laser-gun {
+    position: absolute;
+    top: -4px;
+    width: 8px;
+    height: 8px;
+    margin: 0 0 0 -4px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--msq-c, var(--accent)) 30%, white);
+    box-shadow: 0 0 12px 4px color-mix(in srgb, var(--msq-c, var(--accent)) 90%, transparent);
+    animation: msq-laser-gun 140ms ease-out forwards;
+}
+
+.msq-laser-beam {
+    position: absolute;
+    height: 2px;
+    background: linear-gradient(to right,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 90%, white) 0%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 70%, transparent) 60%,
+        transparent 100%);
+    filter:
+        drop-shadow(0 0 3px color-mix(in srgb, var(--msq-c, var(--accent)) 90%, transparent))
+        drop-shadow(0 0 10px color-mix(in srgb, var(--msq-c, var(--accent)) 70%, transparent));
+    animation: msq-laser-shot 140ms cubic-bezier(0.2, 0.6, 0.3, 1) forwards;
+}
+
+.msq-laser-beam::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 100%;
+    height: 9px;
+    margin-top: -4.5px;
+    border-radius: 4.5px;
+    background: linear-gradient(to right,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 35%, transparent) 0%,
+        color-mix(in srgb, var(--msq-c, var(--accent)) 18%, transparent) 60%,
+        transparent 100%);
+    filter: blur(3px);
+}
+
+@keyframes msq-laser-gun {
+    0% {
+        transform: scale(1.7);
+        opacity: 1;
+    }
+    55% {
+        opacity: 1;
+    }
+    100% {
+        transform: scale(0.4);
+        opacity: 0;
+    }
+}
+
+@keyframes msq-laser-shot {
+    0% {
+        transform: rotate(var(--msq-a, 0rad)) scaleX(0);
+        opacity: 1;
+    }
+    30% {
+        transform: rotate(var(--msq-a, 0rad)) scaleX(1);
+        opacity: 1;
+    }
+    100% {
+        transform: rotate(var(--msq-a, 0rad)) scaleX(1);
+        opacity: 0;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .msq-flash-full,
+    .msq-ring-el,
+    .msq-bloom-glow,
+    .msq-bloom-rays,
+    .msq-spark-dot,
+    .msq-tick-bar,
+    .msq-laser-gun,
+    .msq-laser-beam {
+        display: none;
+    }
+}
