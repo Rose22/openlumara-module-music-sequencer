@@ -595,10 +595,12 @@
        wavetable, chip duty) share this; keys are quantised so every distinct
        wave is built at most once per session. */
     var waveCache = new Map();
-    function dftWave(key, fn) {
+    var WT_H = 96;
+    function dftWave(key, fn, norm) {
         var w = waveCache.get(key);
         if (w) return w;
-        var N = 512, H = 48;
+        var H = 48;
+        var N = H * 8;
         var s = new Float32Array(N);
         for (var i = 0; i < N; i++) s[i] = fn(i / N);
         var re = new Float32Array(H), im = new Float32Array(H);
@@ -612,11 +614,37 @@
             re[k] = 2 * a / N;
             im[k] = -2 * b / N;
         }
+        if (norm) {
+            /* normalise to peak harmonic amplitude 1, so a shape keeps a steady
+               loudness as its harmonic count changes */
+            var peakH = 0;
+            for (var k2 = 1; k2 < H; k2++) peakH = Math.max(peakH, Math.hypot(re[k2], im[k2]));
+            if (peakH > 0) {
+                for (var k3 = 1; k3 < H; k3++) { re[k3] /= peakH; im[k3] /= peakH; }
+            }
+        }
         w = ctx.createPeriodicWave(re, im);
         waveCache.set(key, w);
         return w;
     }
     function n01(v, d, lo, hi) { v = Number(v); if (isNaN(v)) v = d; return Math.max(lo, Math.min(hi, v)); }
+
+    /* band-limited basic shapes (built analytically, no DFT): native
+       square/saw oscillators alias harshly above ~1 kHz, which is most of a
+       lead's range. 64 partials covers everything musical at these pitches. */
+    function basicWave(type) {
+        var key = "basic" + type;
+        var w = waveCache.get(key);
+        if (w) return w;
+        var H = 64, re = new Float32Array(H), im = new Float32Array(H), k;
+        for (k = 1; k < H; k++) {
+            if (type === "square") { if (k % 2) im[k] = 4 / (Math.PI * k); }
+            else im[k] = -2 / (Math.PI * k);
+        }
+        w = ctx.createPeriodicWave(re, im);
+        waveCache.set(key, w);
+        return w;
+    }
 
     /* phase distortion (Casio CZ flavour): the ramp's phase is warped around
        its wrap point - shape 0.05 saw-bright, 0.5 hollow triangle, 0.95
@@ -627,6 +655,12 @@
             var q = p < s ? p * (0.5 / s) : 0.5 + (p - s) * (0.5 / (1 - s));
             return 2 * q - 1;
         });
+    }
+    /* constant-power crossfade pair: linear ramps dip about 3 dB at the
+       midpoint, equal-power holds the perceived level through a sweep */
+    function powerFade(t) {
+        t = n01(t, 0, 1);
+        return [Math.cos(t * Math.PI / 2), Math.sin(t * Math.PI / 2)];
     }
     function pdVoice(pd, freq, when, stopAt, bus) {
         var sA = n01(pd.shape, 0.12, 0.02, 0.98);
@@ -642,66 +676,202 @@
         oA.start(when);
         oA.stop(when + stopAt + 0.02);
         if (Math.abs(sA - sB) > 0.001) {
-            gA.gain.linearRampToValueAtTime(0, when + ct);
             var oB = ctx.createOscillator();
             oB.setPeriodicWave(pdWave(sB));
             oB.frequency.setValueAtTime(freq, when);
             var gB = ctx.createGain();
             gB.gain.setValueAtTime(0, when);
-            gB.gain.linearRampToValueAtTime(1, when + ct);
             oB.connect(gB);
             gB.connect(bus);
             oB.start(when);
             oB.stop(when + stopAt + 0.02);
+            var NSEG = 12;
+            for (var i = 1; i <= NSEG; i++) {
+                var f = powerFade(i / NSEG);
+                gA.gain.linearRampToValueAtTime(f[0], when + ct * i / NSEG);
+                gB.gain.linearRampToValueAtTime(f[1], when + ct * i / NSEG);
+            }
         }
     }
 
-    /* wavetable: procedurally generated additive tables (harmonics = saw
-       forming, even = reedy, sparse = prime partials, bellish) swept by
-       crossfading cached waves at position steps */
+    /* wavetable: procedurally generated additive tables, built as a partial
+       sum straight into harmonic coefficients (no time-domain DFT round trip,
+       so partials land exactly on the bin and stay band-limited). Position 0
+       is the bare/soft end of the table, 1 the fully formed bright end. */
     var WT_PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47];
-    function wtWave(table, p) {
-        var lim = 2 + p * 45;
-        return dftWave("wt" + table + Math.round(p * 40), function (t) {
-            var v = 0;
-            for (var k = 1; k < 48 && k <= lim; k++) {
-                var a = 0;
-                if (table === "even") { if (k % 2 === 0) a = 1 / k; }
-                else if (table === "sparse") { if (WT_PRIMES.indexOf(k) !== -1) a = 1 / Math.sqrt(k); }
-                else a = Math.pow(1 / k, 0.75);
-                if (a) v += a * Math.sin(2 * Math.PI * k * t);
-            }
-            return v;
-        });
+    /* per-partial shape at full formation; fold = mirror phase, quad = the
+       1-0-(-1)-0 pattern Serum's basic shapes get their hollow edge from */
+    function wtShape(table, k) {
+        switch (table) {
+            case "basic": case "saw": return { a: 1 / k, fold: true };
+            case "even": return k % 2 ? { a: 0 } : { a: 1 / k, fold: true };
+            case "odd": return k % 2 ? { a: 1 / k, fold: true } : { a: 0 };
+            case "quad": return k % 4 === 1 ? { a: 1 / k } : (k % 4 === 3 ? { a: -1 / k } : { a: 0 });
+            case "sparse": return WT_PRIMES.indexOf(k) >= 0 ? { a: 1 / Math.sqrt(k), fold: true } : { a: 0 };
+            case "bell": return { a: (k <= 3 ? 1 : 1 / Math.pow(k, 1.7)) * (k % 2 ? 1 : 0.55), fold: true };
+            case "vocal": return { a: (1 / k) * Math.exp(-Math.pow(Math.log(k / 3.2) / 1.15, 2)), fold: true };
+            case "organ": return { a: k % 2 ? 1 / k : 0.62 / k, fold: true };
+            default: return { a: Math.pow(1 / k, 0.8), fold: true };
+        }
     }
+    /* how far a table has opened at harmonic k for sweep position p. the
+       threshold is logarithmic in k (matching how pitch is heard), so the
+       sweep sounds evenly paced from sine to full spectrum; p=0 leaves only
+       the fundamental, p=1 opens the whole band-limited table */
+    function wtOpen(p, k, cap) {
+        if (k === 1) return 1;
+        var f = 0.1 + 0.9 * Math.log(k) / Math.log(Math.max(4, cap));
+        return 1 / (1 + Math.exp(-(p * 1.05 - f) * 10));
+    }
+    /* build the coefficient pair for one table position, scaled so the summed
+       waveform sits at roughly unit peak whatever the shape */
+    function wtCoeffs(table, p, cap, out) {
+        var re = new Float64Array(WT_H), im = new Float64Array(WT_H);
+        var lim = Math.max(2, Math.min(WT_H - 1, cap));
+        var peak = 0, k, sh, gate, a;
+        for (k = 1; k <= lim; k++) {
+            sh = wtShape(table, k);
+            gate = wtOpen(p, k, lim);
+            a = sh.a * gate;
+            if (!a) continue;
+            if (sh.fold) re[k] = a; else im[k] = a;
+            peak += Math.abs(a);
+        }
+        var norm = peak > 0 ? 0.72 / peak : 1;
+        for (k = 1; k < WT_H; k++) { re[k] *= norm; im[k] *= norm; }
+        out.re = re; out.im = im;
+    }
+    var wtScratch = { re: null, im: null };
+    function wtWave(table, p, cap) {
+        var key = "wt" + table + "|" + Math.round(p * 64) + "|" + cap;
+        var w = waveCache.get(key);
+        if (w) return w;
+        wtCoeffs(table, p, cap, wtScratch);
+        /* createPeriodicWave only accepts Float32Array - Float64 inputs throw */
+        w = ctx.createPeriodicWave(Float32Array.from(wtScratch.re), Float32Array.from(wtScratch.im));
+        waveCache.set(key, w);
+        return w;
+    }
+    /* audible partial count at this pitch, so a low bass note gets a dense
+       table and a high lead gets a clean one instead of aliasing */
+    function wtCap(freq) {
+        return Math.max(2, Math.min(WT_H - 1, Math.floor((ctx.sampleRate * 0.44) / Math.max(20, freq))));
+    }
+    /* wavetable voice. Without an LFO the table sweeps once from pos_start to
+       pos_end (attack motion). With lfo {rate, depth, target, wave} the core
+       voice either wobbles - position retraced along the LFO waveform between
+       pos_start and pos_end, depth scaling the excursion around the midpoint
+       - or vibratos (target "pitch", depth 1 = a full semitone). */
     function wtVoice(wt, freq, when, stopAt, bus) {
-        var table = String(wt.table || "harmonics");
+        var table = String(wt.table || "basic");
         var p0 = n01(wt.pos_start, 0.05, 0, 1);
         var p1 = n01(wt.pos_end, 0.9, 0, 1);
-        var steps = Math.round(n01(wt.steps, 8, 1, 24));
-        if (p1 === p0) steps = 1;
-        var sweep = n01(wt.pos_time, 0.4, 0.01, 4);
-        var dt = sweep / steps;
-        var fade = Math.min(0.04, dt * 0.8);
-        for (var i = 0; i < steps; i++) {
-            var p = steps === 1 ? p1 : p0 + (p1 - p0) * i / (steps - 1);
-            var t0 = when + i * dt;
+        var sweep = n01(wt.pos_time, 0.4, 0.01, 8);
+        /* curve shapes the sweep trajectory: <1 rushes out of the attack,
+           >1 creeps then blooms - Serum's slope control */
+        var curve = n01(wt.curve, 1, 0.2, 5);
+        var cap = wtCap(freq);
+        var lf = (wt.lfo && typeof wt.lfo === "object") ? wt.lfo : null;
+        var lDepth = lf ? n01(lf.depth, 0.5, 0, 1) : 0;
+        var lTarget = lf ? String(lf.target || "pos") : "pos";
+        var lRate = lf ? n01(lf.rate, 5, 0.05, 40) : 5;
+        var lWave = lf ? String(lf.wave || "sine") : "sine";
+        var posLfo = !!(lf && lDepth > 0 && lTarget === "pos" && Math.abs(p1 - p0) * cap >= 0.6);
+        var pitchLfo = !!(lf && lDepth > 0 && lTarget === "pitch");
+        var lfo = null, lfoAmt = null;
+        if (pitchLfo) {
+            lfo = ctx.createOscillator();
+            lfo.type = lWave === "square" ? "square" : lWave === "triangle" ? "triangle" : "sine";
+            lfo.frequency.value = lRate;
+            lfoAmt = ctx.createGain();
+            lfoAmt.gain.value = lDepth * 100;
+            lfo.connect(lfoAmt);
+            lfo.start(when);
+            lfo.stop(when + stopAt + 0.05);
+        }
+        /* precompute the position timeline: either one fading sweep across the
+           table, or a repeating LFO path sampled at 16 table snapshots per
+           LFO cycle (capped so a long note can never explode node counts) */
+        var segs = [];
+        var s, w, ph;
+        if (posLfo) {
+            var mid = (p0 + p1) / 2, half = (p1 - p0) / 2 * lDepth;
+            var segDur = Math.max(1 / (lRate * 16), stopAt / 220);
+            var n = Math.max(2, Math.ceil(stopAt / segDur));
+            for (s = 0; s < n; s++) {
+                ph = s * segDur * lRate;
+                w = lWave === "square" ? ((ph % 1) < 0.5 ? 1 : -1)
+                    : lWave === "triangle" ? (1 - 4 * Math.abs((ph % 1) - 0.5))
+                    : Math.sin(2 * Math.PI * ph);
+                segs.push({ p: n01(mid + half * w, 0.5, 0, 1), t: s * segDur, d: segDur });
+            }
+        } else {
+            var steps = Math.round(n01(wt.steps, p1 === p0 ? 1 : Math.max(6, sweep * 24), 1, 64));
+            var dt = sweep / steps;
+            /* the step count is a density cap only; a sweep with no audible
+               movement collapses to a single static table */
+            if (Math.abs(p1 - p0) * cap < 0.6) { steps = 1; dt = sweep; }
+            for (s = 0; s < steps; s++) {
+                var frac = steps === 1 ? 1 : Math.pow(s / (steps - 1), curve);
+                segs.push({ p: p0 + (p1 - p0) * frac, t: s * dt, d: dt });
+            }
+        }
+        /* sampling at a fixed density lands several reads on the same
+           quantised table; merge those runs so a square wobble (2 states)
+           spawns two voices, not one per sample */
+        var merged = [];
+        for (i = 0; i < segs.length; i++) {
+            var lastM = merged[merged.length - 1];
+            if (lastM && Math.round(lastM.p * 64) === Math.round(segs[i].p * 64)) lastM.d += segs[i].d;
+            else merged.push(segs[i]);
+        }
+        segs = merged;
+        /* square wobbles keep their edge, so their crossfade is near instant */
+        var fade = segs.length === 1 ? 0 : Math.min(segs[0].d * (posLfo ? (lWave === "square" ? 0.15 : 0.5) : 0.9), posLfo && lWave === "square" ? 0.003 : 0.02);
+        for (var i = 0; i < segs.length; i++) {
+            var t0 = when + segs[i].t;
             var o = ctx.createOscillator();
-            o.setPeriodicWave(wtWave(table, p));
+            o.setPeriodicWave(wtWave(table, segs[i].p, cap));
             o.frequency.setValueAtTime(freq, when);
+            /* start BEFORE scheduling stop - Web Audio throws InvalidStateError
+               on stop() for a source that has not been started yet */
+            o.start(t0);
             var g = ctx.createGain();
             if (i === 0) g.gain.setValueAtTime(1, when);
             else { g.gain.setValueAtTime(0, t0); g.gain.linearRampToValueAtTime(1, t0 + fade); }
-            if (i < steps - 1) {
-                g.gain.setValueAtTime(1, t0 + dt);
-                g.gain.linearRampToValueAtTime(0, t0 + dt + fade);
-                o.stop(t0 + dt + fade + 0.02);
+            if (i < segs.length - 1) {
+                g.gain.setValueAtTime(1, t0 + segs[i].d);
+                g.gain.linearRampToValueAtTime(0, t0 + segs[i].d + fade);
+                o.stop(t0 + segs[i].d + fade + 0.02);
             } else {
                 o.stop(when + stopAt + 0.02);
             }
             o.connect(g);
             g.connect(bus);
-            o.start(t0);
+            if (lfo) lfoAmt.connect(o.detune);
+        }
+        /* Serum's unison: voices detuned symmetrically around pitch with a
+           deterministic per-voice phase offset, which is what turns one thin
+           wave into a wide, slowly moving stack */
+        var uni = Math.round(n01(wt.unison, 0, 0, 8));
+        if (uni && uni % 2) uni++;
+        var det = n01(wt.detune, 0.12, 0, 1) * 28;
+        /* start offsets decorrelate the stack (the width effect), but stay
+           tiny so the unison still lands on the beat */
+        var jit = Math.min(segs[0].d, 0.03);
+        for (var u = 0; u < uni; u++) {
+            var side = (u % 2 ? 1 : -1) * det * (1 + Math.floor(u / 2) * 0.75);
+            ph = (0.11 + 0.37 * ((u * 7) % 5) / 5) % 1;
+            var ov = ctx.createOscillator();
+            ov.setPeriodicWave(wtWave(table, p1, cap));
+            ov.detune.setValueAtTime(side, when);
+            var gv = ctx.createGain();
+            gv.gain.setValueAtTime(0.9 / uni, when);
+            ov.connect(gv);
+            gv.connect(bus);
+            ov.start(when + ph * jit);
+            ov.stop(when + stopAt + 0.02);
+            if (lfo) lfoAmt.connect(ov.detune);
         }
     }
 
@@ -724,18 +894,21 @@
         oscs[0].stop(when + stopAt + 0.02);
         if (Math.abs(dA - dB) > 0.001) {
             var sw = n01(chip.duty_time, 0.15, 0.01, 4);
-            gA.gain.linearRampToValueAtTime(0, when + sw);
             var oB = ctx.createOscillator();
             oB.setPeriodicWave(chipWave(dB));
             oB.frequency.setValueAtTime(freq, when);
             var gB = ctx.createGain();
             gB.gain.setValueAtTime(0, when);
-            gB.gain.linearRampToValueAtTime(1, when + sw);
             oB.connect(gB);
             gB.connect(bus);
             oscs.push(oB);
             oB.start(when);
             oB.stop(when + stopAt + 0.02);
+            for (var q = 1; q <= 12; q++) {
+                var fq = powerFade(q / 12);
+                gA.gain.linearRampToValueAtTime(fq[0], when + sw * q / 12);
+                gB.gain.linearRampToValueAtTime(fq[1], when + sw * q / 12);
+            }
         }
         var arp = (Array.isArray(chip.arp) ? chip.arp : []).map(Number).filter(function (x) { return !isNaN(x); }).slice(0, 8);
         if (arp.length) {
@@ -856,7 +1029,13 @@
             var o = layers[i];
             if (!o || !(o.level > 0)) continue;
             var osc = ctx.createOscillator();
-            osc.type = o.type;
+            if (o.type === "square" || o.type === "sawtooth") {
+                /* native square/saw alias badly at mid/high pitches; route the
+                   custom layers through the same band-limited tables */
+                osc.setPeriodicWave(basicWave(o.type));
+            } else {
+                osc.type = o.type;
+            }
             var f2 = freq * Math.pow(2, o.octave || 0);
             if (def.pitch && def.pitch.glide) {
                 osc.frequency.setValueAtTime(Math.max(1, f2 * Math.pow(2, def.pitch.glide / 12)), when);
@@ -1566,7 +1745,13 @@
             if (loop.sched < to) {
                 /* one bad definition must not stall every other loop */
                 try { scheduleOccurrence(loop, loop.sched - loop.nextStep, to - loop.nextStep); }
-                catch (e) { loop.playing = false; return; }
+                catch (e) {
+                    if (!loop.errored) {
+                        loop.errored = true;
+                        console.error("[music_sequencer] loop '" + id + "' stopped: a voice threw while being scheduled", e);
+                    }
+                    loop.playing = false; return;
+                }
                 loop.sched = to;
             }
             if (loop.sched >= occEnd) {

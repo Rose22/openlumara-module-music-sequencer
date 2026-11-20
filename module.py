@@ -13,7 +13,7 @@ INSTRUMENTS = ["piano", "bass", "pad", "lead", "pluck", "bells", "sine", "square
 BUILTIN_NAMES = set(DRUM_VOICES) | set(INSTRUMENTS)
 
 OSC_TYPES = ["sine", "square", "sawtooth", "triangle"]
-WT_TABLES = ["harmonics", "even", "sparse"]
+WT_TABLES = ["basic", "saw", "even", "odd", "quad", "sparse", "bell", "vocal", "organ", "harmonics"]
 EFFECTS = [
     "flash", "bloom", "spark", "tick", "laser", "ripple", "wave", "plasma", "aurora",
     "prism", "strobe", "pulse", "wheel", "motes", "vortex", "soundwave",
@@ -268,16 +268,35 @@ def _clean_sound_spec(spec):
         w = spec["wt"]
         if not isinstance(w, dict):
             return None, "spec.wt must be a dict."
-        table = str(w.get("table", "harmonics")).strip().lower()
+        table = str(w.get("table", "basic")).strip().lower()
         if table not in WT_TABLES:
             return None, f"spec.wt.table must be one of: {', '.join(WT_TABLES)}."
         clean["wt"] = {
             "table": table,
             "pos_start": _num(w.get("pos_start"), 0.05, 0.0, 1.0),
             "pos_end": _num(w.get("pos_end"), 0.9, 0.0, 1.0),
-            "steps": int(_num(w.get("steps"), 8, 1, 24)),
-            "pos_time": _num(w.get("pos_time"), 0.4, 0.01, 4.0),
+            "steps": int(_num(w.get("steps"), 16, 1, 64)),
+            "pos_time": _num(w.get("pos_time"), 0.4, 0.01, 8.0),
+            "curve": _num(w.get("curve"), 1.0, 0.2, 5.0),
+            "unison": int(_num(w.get("unison"), 0, 0, 8)),
+            "detune": _num(w.get("detune"), 0.12, 0.0, 1.0),
         }
+        if w.get("lfo") is not None:
+            l = w["lfo"]
+            if not isinstance(l, dict):
+                return None, "spec.wt.lfo must be a dict."
+            ltarget = str(l.get("target", "pos")).strip().lower()
+            if ltarget not in ("pos", "pitch"):
+                return None, "spec.wt.lfo.target must be 'pos' (table wobble) or 'pitch' (vibrato)."
+            lwave = str(l.get("wave", "sine")).strip().lower()
+            if lwave not in ("sine", "triangle", "square"):
+                return None, "spec.wt.lfo.wave must be one of: sine, triangle, square."
+            clean["wt"]["lfo"] = {
+                "rate": _num(l.get("rate"), 5.0, 0.05, 40.0),
+                "depth": _num(l.get("depth"), 0.5, 0.0, 1.0),
+                "target": ltarget,
+                "wave": lwave,
+            }
 
     if spec.get("chip") is not None:
         c = spec["chip"]
@@ -1111,7 +1130,7 @@ class MusicSequencerModule(core.module.Module):
 
         Args:
             name: Lowercase id, e.g. 'pew' or 'wobble'. Cannot shadow a built-in name.
-            spec: Recipe dict. Keys (only osc is required, unless an engine key - fm, pd, ring, wt, chip or grain - is set): osc: list of 1-4 layers [{type: sine|square|sawtooth|triangle, level?: 0-1, octave?: -3..3, detune?: cents -100..100}]; fm?: full FM synth patch {operators: 1-6 dicts [{ratio?: 0.25-32 freq ratio to the played note, level?: 0-1 (mod depth for modulators, amp for carriers), feedback?: 0-0.9 self-modulation, attack?, decay?, sustain?: 0-1, release?}], algorithm: {modulator_index: carrier_index or list}, output: [carrier indexes]} - modulation depth scales with pitch like real FM; can coexist with osc layers; pd?: phase distortion, Casio CZ flavour {shape?: 0.02-0.98 warp (0.05 saw-bright, 0.5 hollow), shape_end?: settle target, decay?: settle seconds}; ring?: ring modulator over the whole voice {ratio?: mod freq relative to note (default 1.5) or freq?: absolute Hz} - stacks with any other engine, alone gets a sine carrier; wt?: wavetable sweep {table?: harmonics|even|sparse, pos_start?: 0-1, pos_end?: 0-1, steps?: 1-24, pos_time?: seconds}; chip?: NES pulse voice {duty?: 0.03-0.5, duty_end?: sweep target, arp?: up to 8 semitone offsets cycled as chip arpeggio, arp_rate?: 1-100 steps/s}; grain?: granular cloud of the note {size?: grain s (default 0.08), rate?: grains/s (default 14), scatter?: pitch jitter 0-0.2, src?: sine|noise}; noise?: {level?: 0-1, filter?: lowpass|highpass|bandpass, freq?: 20-20000} blended noise layer; filter?: {type?: lowpass|highpass|bandpass, cutoff?: 20-20000, q?: 0-30, env?: sweep start offset in semitones above the cutoff, positive = falling sweep (-48..48), env_time?: seconds} - env around 24-36 gives classic plucks; env?: {attack?, decay?, sustain? 0-1, release?} in seconds (sustain only heard on held notes; a ping is attack 0.002 decay 0.4 sustain 0, a pad attack 0.3 decay 0.2 sustain 0.8 release 0.5); pitch?: {glide?: start offset in semitones above the note, positive = falling sweep (-36..36), glide_time?: seconds}; base_note?: MIDI number used as a drum voice (default 36). E.g. laser: {"osc": [{"type": "sawtooth"}], "pitch": {"glide": 24}, "filter": {"cutoff": 6000, "env": 36}, "env": {"attack": 0.002, "decay": 0.25}, "base_note": 72}
+            spec: Recipe dict. Keys (only osc is required, unless an engine key - fm, pd, ring, wt, chip or grain - is set): osc: list of 1-4 layers [{type: sine|square|sawtooth|triangle, level?: 0-1, octave?: -3..3, detune?: cents -100..100}]; fm?: full FM synth patch {operators: 1-6 dicts [{ratio?: 0.25-32 freq ratio to the played note, level?: 0-1 (mod depth for modulators, amp for carriers), feedback?: 0-0.9 self-modulation, attack?, decay?, sustain?: 0-1, release?}], algorithm: {modulator_index: carrier_index or list}, output: [carrier indexes]} - modulation depth scales with pitch like real FM; can coexist with osc layers; pd?: phase distortion, Casio CZ flavour {shape?: 0.02-0.98 warp (0.05 saw-bright, 0.5 hollow), shape_end?: settle target, decay?: settle seconds}; ring?: ring modulator over the whole voice {ratio?: mod freq relative to note (default 1.5) or freq?: absolute Hz} - stacks with any other engine, alone gets a sine carrier; wt?: wavetable {table?: basic|saw|even|odd|quad|sparse|bell|vocal|organ|harmonics, pos_start?: 0-1, pos_end?: 0-1, steps?: 1-64, pos_time?: seconds, curve?: 0.2-5 sweep slope, unison?: 0-8 detuned voices, detune?: 0-1 spread, lfo?: {rate?: Hz 0.05-40 (default 5), depth?: 0-1, target?: pos|pitch, wave?: sine|triangle|square}}; tables are band-limited per note (no aliasing at any pitch); odd unison is rounded up to keep the stack symmetrical; with lfo target=pos the table wobbles back and forth between pos_start and pos_end (depth scales the excursion around the midpoint; replaces the one-shot sweep) - that's the dubstep wobble; target=pitch vibrates pitch instead (depth 1 = one semitone); chip?: NES pulse voice {duty?: 0.03-0.5, duty_end?: sweep target, arp?: up to 8 semitone offsets cycled as chip arpeggio, arp_rate?: 1-100 steps/s}; grain?: granular cloud of the note {size?: grain s (default 0.08), rate?: grains/s (default 14), scatter?: pitch jitter 0-0.2, src?: sine|noise}; noise?: {level?: 0-1, filter?: lowpass|highpass|bandpass, freq?: 20-20000} blended noise layer; filter?: {type?: lowpass|highpass|bandpass, cutoff?: 20-20000, q?: 0-30, env?: sweep start offset in semitones above the cutoff, positive = falling sweep (-48..48), env_time?: seconds} - env around 24-36 gives classic plucks; env?: {attack?, decay?, sustain? 0-1, release?} in seconds (sustain only heard on held notes; a ping is attack 0.002 decay 0.4 sustain 0, a pad attack 0.3 decay 0.2 sustain 0.8 release 0.5); pitch?: {glide?: start offset in semitones above the note, positive = falling sweep (-36..36), glide_time?: seconds}; base_note?: MIDI number used as a drum voice (default 36). E.g. laser: {"osc": [{"type": "sawtooth"}], "pitch": {"glide": 24}, "filter": {"cutoff": 6000, "env": 36}, "env": {"attack": 0.002, "decay": 0.25}, "base_note": 72}
         """
         chat_id = self._chat_id()
         if not chat_id:
