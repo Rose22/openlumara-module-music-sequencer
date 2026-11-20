@@ -466,7 +466,7 @@
             release: num(raw.release, 0.15, 0.005, 20)
         };
     }
-    function fmHit(patch, freq, when, vel, gate, dest) {
+    function fmHit(patch, freq, when, vel, gate, dest, mods) {
         var raw = (patch && patch.operators) || [];
         var out = (patch && patch.output) || [];
         var n = Math.min(raw.length, 6);
@@ -530,6 +530,7 @@
             osc.type = "sine";
             osc.frequency.setValueAtTime(f, when);
             osc.connect(g);
+            attachMods(mods, osc.detune);
             if (p.feedback > 0) {
                 var fbg = ctx.createGain();
                 fbg.gain.value = p.feedback * f * 0.25;
@@ -662,7 +663,7 @@
         t = n01(t, 0, 1);
         return [Math.cos(t * Math.PI / 2), Math.sin(t * Math.PI / 2)];
     }
-    function pdVoice(pd, freq, when, stopAt, bus) {
+    function pdVoice(pd, freq, when, stopAt, bus, mods) {
         var sA = n01(pd.shape, 0.12, 0.02, 0.98);
         var sB = n01(pd.shape_end, 0.5, 0.02, 0.98);
         var ct = n01(pd.decay, 0.25, 0.01, 4);
@@ -673,6 +674,7 @@
         gA.gain.setValueAtTime(1, when);
         oA.connect(gA);
         gA.connect(bus);
+        attachMods(mods, oA.detune);
         oA.start(when);
         oA.stop(when + stopAt + 0.02);
         if (Math.abs(sA - sB) > 0.001) {
@@ -683,6 +685,7 @@
             gB.gain.setValueAtTime(0, when);
             oB.connect(gB);
             gB.connect(bus);
+            attachMods(mods, oB.detune);
             oB.start(when);
             oB.stop(when + stopAt + 0.02);
             var NSEG = 12;
@@ -701,7 +704,9 @@
     var WT_PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47];
     /* per-partial shape at full formation; fold = mirror phase, quad = the
        1-0-(-1)-0 pattern Serum's basic shapes get their hollow edge from */
-    function wtShape(table, k) {
+    function wtShape(table, k, amps) {
+        /* custom table: raw per-harmonic amplitudes, negative = phase-flipped */
+        if (amps) { var av = Number(amps[k - 1]); return { a: isNaN(av) ? 0 : av, fold: true }; }
         switch (table) {
             case "basic": case "saw": return { a: 1 / k, fold: true };
             case "even": return k % 2 ? { a: 0 } : { a: 1 / k, fold: true };
@@ -725,12 +730,12 @@
     }
     /* build the coefficient pair for one table position, scaled so the summed
        waveform sits at roughly unit peak whatever the shape */
-    function wtCoeffs(table, p, cap, out) {
+    function wtCoeffs(table, p, cap, out, amps) {
         var re = new Float64Array(WT_H), im = new Float64Array(WT_H);
         var lim = Math.max(2, Math.min(WT_H - 1, cap));
         var peak = 0, k, sh, gate, a;
         for (k = 1; k <= lim; k++) {
-            sh = wtShape(table, k);
+            sh = wtShape(table, k, amps);
             gate = wtOpen(p, k, lim);
             a = sh.a * gate;
             if (!a) continue;
@@ -742,11 +747,11 @@
         out.re = re; out.im = im;
     }
     var wtScratch = { re: null, im: null };
-    function wtWave(table, p, cap) {
+    function wtWave(table, p, cap, amps) {
         var key = "wt" + table + "|" + Math.round(p * 64) + "|" + cap;
         var w = waveCache.get(key);
         if (w) return w;
-        wtCoeffs(table, p, cap, wtScratch);
+        wtCoeffs(table, p, cap, wtScratch, amps);
         /* createPeriodicWave only accepts Float32Array - Float64 inputs throw */
         w = ctx.createPeriodicWave(Float32Array.from(wtScratch.re), Float32Array.from(wtScratch.im));
         waveCache.set(key, w);
@@ -762,8 +767,16 @@
        voice either wobbles - position retraced along the LFO waveform between
        pos_start and pos_end, depth scaling the excursion around the midpoint
        - or vibratos (target "pitch", depth 1 = a full semitone). */
-    function wtVoice(wt, freq, when, stopAt, bus) {
-        var table = String(wt.table || "basic");
+    function wtVoice(wt, freq, when, stopAt, bus, mods) {
+        /* custom table: a raw list of harmonic amplitudes gets a stable cache
+           key derived from its values; built-ins keep their name key */
+        var amps = null, table;
+        if (Array.isArray(wt.table)) {
+            amps = wt.table.map(Number).slice(0, 64);
+            table = "arr:" + amps.map(function (x) { return Math.round((isNaN(x) ? 0 : x) * 1000) / 1000; }).join(",");
+        } else {
+            table = String(wt.table || "basic");
+        }
         var p0 = n01(wt.pos_start, 0.05, 0, 1);
         var p1 = n01(wt.pos_end, 0.9, 0, 1);
         var sweep = n01(wt.pos_time, 0.4, 0.01, 8);
@@ -831,7 +844,7 @@
         for (var i = 0; i < segs.length; i++) {
             var t0 = when + segs[i].t;
             var o = ctx.createOscillator();
-            o.setPeriodicWave(wtWave(table, segs[i].p, cap));
+            o.setPeriodicWave(wtWave(table, segs[i].p, cap, amps));
             o.frequency.setValueAtTime(freq, when);
             /* start BEFORE scheduling stop - Web Audio throws InvalidStateError
                on stop() for a source that has not been started yet */
@@ -849,6 +862,7 @@
             o.connect(g);
             g.connect(bus);
             if (lfo) lfoAmt.connect(o.detune);
+            attachMods(mods, o.detune);
         }
         /* Serum's unison: voices detuned symmetrically around pitch with a
            deterministic per-voice phase offset, which is what turns one thin
@@ -856,6 +870,7 @@
         var uni = Math.round(n01(wt.unison, 0, 0, 8));
         if (uni && uni % 2) uni++;
         var det = n01(wt.detune, 0.12, 0, 1) * 28;
+        var spread = n01(wt.spread, 0.5, 0, 1);
         /* start offsets decorrelate the stack (the width effect), but stay
            tiny so the unison still lands on the beat */
         var jit = Math.min(segs[0].d, 0.03);
@@ -863,15 +878,23 @@
             var side = (u % 2 ? 1 : -1) * det * (1 + Math.floor(u / 2) * 0.75);
             ph = (0.11 + 0.37 * ((u * 7) % 5) / 5) % 1;
             var ov = ctx.createOscillator();
-            ov.setPeriodicWave(wtWave(table, p1, cap));
+            ov.setPeriodicWave(wtWave(table, p1, cap, amps));
             ov.detune.setValueAtTime(side, when);
             var gv = ctx.createGain();
             gv.gain.setValueAtTime(0.9 / uni, when);
             ov.connect(gv);
-            gv.connect(bus);
+            /* fan the stack across the stereo field - the width half of a
+               proper supersaw */
+            if (uni > 1 && spread > 0 && ctx.createStereoPanner) {
+                var upn = ctx.createStereoPanner();
+                upn.pan.value = (u / (uni - 1) * 2 - 1) * spread;
+                gv.connect(upn);
+                upn.connect(bus);
+            } else gv.connect(bus);
             ov.start(when + ph * jit);
             ov.stop(when + stopAt + 0.02);
             if (lfo) lfoAmt.connect(ov.detune);
+            attachMods(mods, ov.detune);
         }
     }
 
@@ -880,7 +903,7 @@
     function chipWave(d) {
         return dftWave("chip" + Math.round(d * 40), function (p) { return p < d ? 1 : -1; });
     }
-    function chipVoice(chip, freq, when, stopAt, bus) {
+    function chipVoice(chip, freq, when, stopAt, bus, mods) {
         var dA = n01(chip.duty, 0.5, 0.03, 0.5);
         var dB = chip.duty_end == null ? dA : n01(chip.duty_end, dA, 0.03, 0.5);
         var oscs = [ctx.createOscillator()];
@@ -890,6 +913,7 @@
         gA.gain.setValueAtTime(1, when);
         oscs[0].connect(gA);
         gA.connect(bus);
+        attachMods(mods, oscs[0].detune);
         oscs[0].start(when);
         oscs[0].stop(when + stopAt + 0.02);
         if (Math.abs(dA - dB) > 0.001) {
@@ -901,6 +925,7 @@
             gB.gain.setValueAtTime(0, when);
             oB.connect(gB);
             gB.connect(bus);
+            attachMods(mods, oB.detune);
             oscs.push(oB);
             oB.start(when);
             oB.stop(when + stopAt + 0.02);
@@ -963,9 +988,276 @@
         }
     }
 
+    /* -------------------------
+     * per-loop routing: FX chain, stereo pan, sidechain ducking
+     * ------------------------- */
+    var DELAY_SYNC = { "1/1": 4, bar: 4, "1/2": 2, "1/4": 1, "1/4d": 1.5, "1/8": 0.5, "1/8d": 0.75, "1/8t": 2 / 3, "1/16": 0.25, "1/16d": 0.375, "1/16t": 1 / 3 };
+    var LFO_SYNC = { "1/1": 4, bar: 4, "1/2": 2, "1/4": 1, "1/8": 0.5, "1/16": 0.25, "1/32": 0.125, "1/4t": 1.5, "1/8t": 2 / 3, "1/16t": 1 / 3 };
+
+    function attachMods(mods, param) {
+        if (!mods) return;
+        for (var i = 0; i < mods.length; i++) { try { mods[i].connect(param); } catch (e) {} }
+    }
+
+    function distCurve(kind, d, bits) {
+        var n = 2048, c = new Float32Array(n), i, x;
+        if (kind === "crush") {
+            var steps = Math.pow(2, Math.max(1, Math.min(8, Number(bits) || 5)));
+            var pgain = 1 + d * 6;
+            for (i = 0; i < n; i++) {
+                x = ((2 * i) / (n - 1) - 1) * pgain;
+                c[i] = Math.max(-1, Math.min(1, Math.round(x * steps) / steps));
+            }
+            return c;
+        }
+        if (kind === "hard") {
+            var k = 0.25 + d * 0.6;
+            for (i = 0; i < n; i++) {
+                x = ((2 * i) / (n - 1) - 1) / k;
+                c[i] = Math.max(-1, Math.min(1, x));
+            }
+            return c;
+        }
+        if (kind === "fold") {
+            var g = 1 + d * 4;
+            for (i = 0; i < n; i++) {
+                x = ((2 * i) / (n - 1) - 1) * g;
+                c[i] = Math.asin(Math.sin(x * Math.PI / 2)) * (2 / Math.PI);
+            }
+            return c;
+        }
+        return tanhCurve(1.2 + d * 6);
+    }
+
+    /* one stage of a loop's FX chain: wraps nextIn, returns the stage input */
+    function buildFxStage(fx, nextIn, synced, keepAlive) {
+        var t = String((fx && fx.type) || "").toLowerCase();
+        var input, i;
+        if (t === "dist") {
+            var d = n01(fx.drive, 0.5, 0, 1);
+            var mix = n01(fx.mix, 1, 0, 1);
+            input = ctx.createGain();
+            var pre = ctx.createGain(); pre.gain.value = 1 + d * 8;
+            var sh = ctx.createWaveShaper(); sh.curve = distCurve(String(fx.curve || "tanh"), d, fx.bits);
+            var post = ctx.createGain(); post.gain.value = 1 / (0.6 + d * 1.4);
+            var wet = ctx.createGain(); wet.gain.value = mix;
+            var dry = ctx.createGain(); dry.gain.value = 1 - mix;
+            input.connect(pre); pre.connect(sh); sh.connect(post); post.connect(wet); wet.connect(nextIn);
+            input.connect(dry); dry.connect(nextIn);
+            return input;
+        }
+        if (t === "chorus") {
+            var rate = n01(fx.rate, 0.6, 0.05, 4);
+            var depth = n01(fx.depth, 0.5, 0, 1) * 0.0028;
+            var cmix = n01(fx.mix, 0.4, 0, 1);
+            input = ctx.createGain();
+            var cdry = ctx.createGain(); cdry.gain.value = 1 - cmix;
+            var cwet = ctx.createGain(); cwet.gain.value = cmix * 0.9;
+            input.connect(cdry); cdry.connect(nextIn); cwet.connect(nextIn);
+            var offs = [0.021, 0.027], pans = [-0.7, 0.7];
+            for (i = 0; i < 2; i++) {
+                var dl = ctx.createDelay(0.1); dl.delayTime.value = offs[i];
+                input.connect(dl);
+                if (ctx.createStereoPanner) {
+                    var pn = ctx.createStereoPanner(); pn.pan.value = pans[i];
+                    dl.connect(pn); pn.connect(cwet);
+                } else dl.connect(cwet);
+                var lo = ctx.createOscillator(); lo.type = "sine"; lo.frequency.value = rate;
+                var lg = ctx.createGain(); lg.gain.value = i ? -depth : depth;
+                lo.connect(lg); lg.connect(dl.delayTime);
+                lo.start();
+                keepAlive.push(lo);
+            }
+            return input;
+        }
+        if (t === "delay") {
+            var secs = Number(fx.time);
+            var beats = null;
+            if (!(secs >= 0.01)) {
+                beats = DELAY_SYNC[String(fx.sync || "1/4")];
+                secs = beats != null ? beats * 60 / bpm : 0.375;
+            }
+            var dinput = ctx.createGain();
+            var dmix = n01(fx.mix, 0.3, 0, 1);
+            var ddry = ctx.createGain(); ddry.gain.value = 1 - dmix;
+            dinput.connect(ddry); ddry.connect(nextIn);
+            var wetg = ctx.createGain(); wetg.gain.value = dmix; wetg.connect(nextIn);
+            var lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = n01(fx.damp, 4500, 200, 16000);
+            var fbg = ctx.createGain(); fbg.gain.value = n01(fx.feedback, 0.35, 0, 0.92);
+            var dt = Math.max(0.01, Math.min(2, secs));
+            var d1 = ctx.createDelay(2); d1.delayTime.value = dt;
+            dinput.connect(d1);
+            if (beats != null) synced.push({ node: d1, beats: beats });
+            if (fx.pingpong && ctx.createStereoPanner) {
+                var d2 = ctx.createDelay(2); d2.delayTime.value = dt;
+                if (beats != null) synced.push({ node: d2, beats: beats });
+                var pL = ctx.createStereoPanner(); pL.pan.value = -0.8;
+                var pR = ctx.createStereoPanner(); pR.pan.value = 0.8;
+                d1.connect(pL); pL.connect(wetg); pL.connect(lp);
+                d2.connect(pR); pR.connect(wetg); pR.connect(lp);
+                lp.connect(fbg); fbg.connect(d1); fbg.connect(d2);
+            } else {
+                d1.connect(lp); lp.connect(fbg); fbg.connect(d1); d1.connect(wetg);
+            }
+            return dinput;
+        }
+        if (t === "verb") {
+            input = ctx.createGain();
+            input.connect(nextIn);
+            if (verbSend) {
+                var vs = ctx.createGain(); vs.gain.value = n01(fx.mix, 0.3, 0, 1) * 1.15;
+                input.connect(vs); vs.connect(verbSend);
+            }
+            return input;
+        }
+        return nextIn;
+    }
+
+    function destroyChain(e) {
+        if (!e || !e.chain) return;
+        var c = e.chain;
+        e.chain = null;
+        try { c.input.disconnect(); } catch (x) {}
+        try { c.duck.disconnect(); } catch (x) {}
+        (c.lfos || []).forEach(function (lo) { try { lo.stop(); lo.disconnect(); } catch (x) {} });
+    }
+
+    /* lazy per-loop chain (built once audio is unlocked): voices -> fx -> pan
+       -> duck -> master/instrument bus; only created when the loop asks for
+       one, so plain loops stay on the direct path */
+    function ensureChain(loop) {
+        if (loop.chain || !ctx || !loop.def) return;
+        var d = loop.def;
+        if (!d.sidechain && !(d.fx && d.fx.length) && d.pan == null) return;
+        try {
+            var duck = ctx.createGain();
+            duck.gain.value = 1;
+            duck.connect(audioOut(d.voice || d.instrument));
+            var pan = null;
+            if (ctx.createStereoPanner) {
+                pan = ctx.createStereoPanner();
+                pan.pan.value = Math.max(-1, Math.min(1, Number(loop.panOv != null ? loop.panOv : (d.pan || 0))));
+                pan.connect(duck);
+            }
+            var nextIn = pan || duck;
+            var synced = [], lfos = [];
+            var input = nextIn;
+            if (d.fx && d.fx.length) {
+                for (var i = d.fx.length - 1; i >= 0; i--) input = buildFxStage(d.fx[i], input, synced, lfos) || input;
+            }
+            loop.chain = { input: input, duck: duck, pan: pan, synced: synced, lfos: lfos };
+        } catch (e) { loop.chain = null; }
+    }
+
+    /* sidechain pump: duck the loop on a fixed grid, phase-aligned to the bar.
+       chained linear ramps stay continuous even when ducks overlap. */
+    function scheduleDucks(loop, from, to) {
+        var sc = loop.def && loop.def.sidechain;
+        if (!sc || !loop.chain) return;
+        var iv = sc.rate === "8th" ? 2 : sc.rate === "16th" ? 1 : 4;
+        var depth = Math.max(0, Math.min(0.95, Number(sc.depth) || 0.65));
+        var atk = Math.max(0.001, Number(sc.attack) || 0.006);
+        var rel = Math.max(0.02, Number(sc.release) || 0.22);
+        var g = loop.chain.duck.gain;
+        for (var k = Math.ceil(from / iv) * iv; k < to; k += iv) {
+            var v = loop.occT0 + k * loop.occCell;
+            g.linearRampToValueAtTime(1 - depth, v + atk);
+            g.linearRampToValueAtTime(1, v + atk + rel);
+        }
+    }
+
+    /* voice LFOs: def.lfo = {target: pitch|cutoff|amp, rate: Hz or tempo sync
+       ("1/8", "1/16t", "bar"...), wave, depth 0-1, delay: fade-in s} or a list
+       of up to 4. cutoff/amp connect to the voice's own nodes; pitch mods are
+       returned so every engine can attach them to each oscillator's detune. */
+    function buildVoiceLfos(def, when, stopAt, tgt) {
+        var list = def.lfo == null ? [] : (Array.isArray(def.lfo) ? def.lfo : [def.lfo]);
+        var nodes = [];
+        for (var i = 0; i < list.length && i < 4; i++) {
+            var l = list[i];
+            if (!l || typeof l !== "object") continue;
+            var target = String(l.target || "pitch").toLowerCase();
+            var hz = Number(l.rate);
+            if (!(hz >= 0.05)) {
+                var beats = LFO_SYNC[String(l.rate || "1/8")];
+                hz = beats != null ? (bpm / 60) / beats : 5;
+            }
+            var depth = n01(l.depth, 0.5, 0, 1);
+            if (depth <= 0.001) continue;
+            var wave = String(l.wave || "sine").toLowerCase();
+            var lo = ctx.createOscillator();
+            lo.type = wave === "square" ? "square" : wave === "triangle" ? "triangle" : wave === "sawtooth" ? "sawtooth" : "sine";
+            lo.frequency.value = hz;
+            var amt = ctx.createGain();
+            var amtVal = target === "cutoff" ? depth * Math.max(30, tgt.cutoff || 1000) * 0.98
+                : target === "amp" ? depth * (tgt.ampPeak || 0.5)
+                : depth * 100;
+            var dl = n01(l.delay, 0, 0, 8);
+            if (dl > 0.005) {
+                amt.gain.setValueAtTime(0.0001, when);
+                amt.gain.linearRampToValueAtTime(amtVal, when + dl);
+            } else amt.gain.value = amtVal;
+            lo.connect(amt);
+            lo.start(when);
+            lo.stop(when + stopAt + 0.05);
+            nodes.push(lo, amt);
+            if (target === "cutoff") {
+                for (var fi = 0; fi < (tgt.filters || []).length; fi++) amt.connect(tgt.filters[fi].frequency);
+            } else if (target === "amp" && tgt.amp) amt.connect(tgt.amp.gain);
+            else tgt.pitchMods.push(amt);
+        }
+        if (nodes.length) {
+            (function (ns) {
+                setTimeout(function () { ns.forEach(function (x) { try { x.disconnect(); } catch (e) {} }); }, (stopAt + 0.6) * 1000);
+            })(nodes);
+        }
+        return tgt.pitchMods;
+    }
+
+    /* risers and downlifters: noise or a tone swept across the note's whole
+       gate; from/to in Hz (0 = sensible default), curve shapes the rise. */
+    function sweepVoice(sw, freq, when, stopAt, bus) {
+        var kind = String(sw.src || "noise").toLowerCase();
+        var curve = n01(sw.curve, 1, 0.2, 5);
+        var durT = Math.max(0.08, stopAt);
+        var g = ctx.createGain();
+        g.gain.value = n01(sw.level, 0.4, 0, 1);
+        g.connect(bus);
+        var f0 = swClamp(sw.from, kind === "noise" ? 150 : freq / 2);
+        var f1 = swClamp(sw.to, kind === "noise" ? 14000 : freq * 2);
+        var n = 48, arr = new Float32Array(n), r = f1 / f0;
+        for (var i = 0; i < n; i++) {
+            var t = i / (n - 1);
+            arr[i] = Math.max(10, Math.min(20000, f0 * Math.pow(r, Math.pow(t, curve))));
+        }
+        if (kind === "noise") {
+            var src = ctx.createBufferSource();
+            src.buffer = noiseBuffer();
+            src.loop = true;
+            var nf = ctx.createBiquadFilter();
+            nf.type = String(sw.filter || "lowpass");
+            nf.Q.value = n01(sw.q, 1.2, 0.0001, 12);
+            nf.frequency.setValueCurveAtTime(arr, when, durT);
+            src.connect(nf); nf.connect(g);
+            src.start(when, Math.random() * 1.5);
+            src.stop(when + durT + 0.05);
+        } else {
+            var osc = ctx.createOscillator();
+            osc.type = kind === "sawtooth" ? "sawtooth" : kind === "square" ? "square" : kind === "triangle" ? "triangle" : "sine";
+            osc.frequency.setValueCurveAtTime(arr, when, durT);
+            osc.connect(g);
+            osc.start(when);
+            osc.stop(when + durT + 0.05);
+        }
+    }
+    function swClamp(v, dflt) {
+        var x = Number(v);
+        if (!(x >= 10)) x = dflt;
+        return Math.max(10, Math.min(20000, x));
+    }
+
     function customHit(def, freq, when, vel, gate, dest) {
         dest = dest || master;
-        if (def.fm) fmHit(def.fm, freq, when, vel, gate, dest);
         var e = def.env || {};
         var attack = e.attack != null ? e.attack : 0.005;
         var decay = e.decay != null ? e.decay : 0.3;
@@ -1001,55 +1293,110 @@
             sink = ringG;
         }
         var bus = sink;
+        var filters = [];
+        var cutoffNow = 8000;
         if (def.filter) {
             var fl = def.filter;
-            var f = ctx.createBiquadFilter();
-            f.type = fl.type || "lowpass";
-            f.Q.value = fl.q != null ? fl.q : 1;
-            var cutoff = fl.cutoff || 8000;
-            if (fl.env) {
-                f.frequency.setValueAtTime(Math.min(20000, cutoff * Math.pow(2, fl.env / 12)), when);
-                f.frequency.exponentialRampToValueAtTime(cutoff, when + (fl.env_time || 0.2));
-            } else {
-                f.frequency.setValueAtTime(cutoff, when);
+            var poles = Math.round(n01(fl.poles, 1, 1, 2));
+            cutoffNow = fl.cutoff || 8000;
+            if (fl.keytrack) cutoffNow *= Math.pow(Math.max(0.05, freq / 440), n01(fl.keytrack, 1, 0, 1));
+            cutoffNow = Math.max(20, Math.min(20000, cutoffNow));
+            var fOff = 0, fEnd = 0, fAtk = 0, fDec = 0.2;
+            if (typeof fl.env === "number") {
+                fOff = fl.env; fDec = fl.env_time || 0.2;
+            } else if (fl.env && typeof fl.env === "object") {
+                fOff = n01(fl.env.from, 24, -60, 60);
+                fEnd = n01(fl.env.to, 0, -60, 60);
+                fAtk = n01(fl.env.attack, 0, 0, 8);
+                fDec = n01(fl.env.decay, 0.3, 0.01, 8);
             }
-            f.connect(sink);
-            bus = f;
+            for (var pi = 0; pi < poles; pi++) {
+                var fp = ctx.createBiquadFilter();
+                fp.type = fl.type || "lowpass";
+                fp.Q.value = fl.q != null ? fl.q : 1;
+                /* second pole a bit lower keeps the 24 dB cascade musical */
+                var base = Math.max(20, Math.min(20000, cutoffNow * (pi ? 0.82 : 1)));
+                var v0 = Math.max(20, Math.min(20000, base * Math.pow(2, fOff / 12)));
+                var v1 = Math.max(20, Math.min(20000, base * Math.pow(2, fEnd / 12)));
+                if (fOff || fEnd) {
+                    fp.frequency.setValueAtTime(v0, when);
+                    if (fAtk > 0.005) fp.frequency.setValueAtTime(v0, when + fAtk);
+                    fp.frequency.exponentialRampToValueAtTime(v1, when + fAtk + fDec);
+                } else {
+                    fp.frequency.setValueAtTime(base, when);
+                }
+                fp.connect(pi ? filters[pi - 1] : sink);
+                filters.push(fp);
+            }
+            if (filters.length) bus = filters[filters.length - 1];
         }
 
-        if (def.pd) pdVoice(def.pd, freq, when, stopAt, bus);
-        if (def.wt) wtVoice(def.wt, freq, when, stopAt, bus);
-        if (def.chip) chipVoice(def.chip, freq, when, stopAt, bus);
-        if (def.grain) grainVoice(def.grain, freq, when, vel, gate, bus);
-        var layers = def.osc || [];
-        if (!layers.length && def.ring && !def.fm && !def.pd && !def.wt && !def.chip && !def.grain) {
-            layers = [{ type: "sine", level: 1 }];
+        var pitchMods = buildVoiceLfos(def, when, stopAt, { cutoff: cutoffNow, amp: amp, ampPeak: peak, filters: filters, pitchMods: [] });
+
+        /* generic unison: whole engines re-struck detuned and fanned across
+           the stereo field (the wavetable stacks its own voices internally) */
+        var un = def.unison && typeof def.unison === "object" ? def.unison : null;
+        var uni = un ? Math.max(1, Math.min(8, Math.round(Number(un.voices) || 3))) : 1;
+        var udet = un ? n01(un.detune, 0.5, 0, 1) * 22 : 0;
+        var uspr = un ? n01(un.spread, 0.7, 0, 1) : 0;
+        function unFreq(u) {
+            if (uni <= 1 || u === 0) return freq;
+            var s = (u % 2 ? 1 : -1) * (1 + Math.floor((u - 1) / 2));
+            return freq * Math.pow(2, ((s / Math.max(1, Math.ceil((uni - 1) / 2))) * udet) / 12);
         }
-        for (var i = 0; i < layers.length; i++) {
-            var o = layers[i];
-            if (!o || !(o.level > 0)) continue;
-            var osc = ctx.createOscillator();
-            if (o.type === "square" || o.type === "sawtooth") {
-                /* native square/saw alias badly at mid/high pitches; route the
-                   custom layers through the same band-limited tables */
-                osc.setPeriodicWave(basicWave(o.type));
-            } else {
-                osc.type = o.type;
+        function unOut(u, target) {
+            if (uni <= 1) return target;
+            var pg = ctx.createGain();
+            pg.gain.value = 1 / Math.sqrt(uni);
+            if (uspr > 0 && ctx.createStereoPanner) {
+                var pn = ctx.createStereoPanner();
+                pn.pan.value = (u / (uni - 1) * 2 - 1) * uspr;
+                pg.connect(pn); pn.connect(target);
+            } else pg.connect(target);
+            return pg;
+        }
+        for (var u = 0; u < uni; u++) {
+            var fu = unFreq(u);
+            var cu = unOut(u, bus);
+            if (def.pd) pdVoice(def.pd, fu, when, stopAt, cu, pitchMods);
+            if (def.wt) wtVoice(def.wt, fu, when, stopAt, cu, pitchMods);
+            if (def.chip) chipVoice(def.chip, fu, when, stopAt, cu, pitchMods);
+            /* FM carries its own per-operator envelopes, so (as before) it
+               feeds the destination directly instead of the amp'd bus */
+            if (def.fm) fmHit(def.fm, fu, when, vel, gate, unOut(u, dest), pitchMods);
+            if (def.grain && u === 0) grainVoice(def.grain, fu, when, vel, gate, cu);
+            if (def.sweep && u === 0) sweepVoice(def.sweep, fu, when, stopAt, cu);
+            var layers = def.osc || [];
+            if (!layers.length && def.ring && !def.fm && !def.pd && !def.wt && !def.chip && !def.grain && !def.sweep) {
+                layers = [{ type: "sine", level: 1 }];
             }
-            var f2 = freq * Math.pow(2, o.octave || 0);
-            if (def.pitch && def.pitch.glide) {
-                osc.frequency.setValueAtTime(Math.max(1, f2 * Math.pow(2, def.pitch.glide / 12)), when);
-                osc.frequency.exponentialRampToValueAtTime(f2, when + (def.pitch.glide_time || 0.12));
-            } else {
-                osc.frequency.setValueAtTime(f2, when);
+            for (var li = 0; li < layers.length; li++) {
+                var o = layers[li];
+                if (!o || !(o.level > 0)) continue;
+                var osc = ctx.createOscillator();
+                if (o.type === "square" || o.type === "sawtooth") {
+                    /* native square/saw alias badly at mid/high pitches; route the
+                       custom layers through the same band-limited tables */
+                    osc.setPeriodicWave(basicWave(o.type));
+                } else {
+                    osc.type = o.type;
+                }
+                var f2 = fu * Math.pow(2, o.octave || 0);
+                if (def.pitch && def.pitch.glide) {
+                    osc.frequency.setValueAtTime(Math.max(1, f2 * Math.pow(2, def.pitch.glide / 12)), when);
+                    osc.frequency.exponentialRampToValueAtTime(f2, when + (def.pitch.glide_time || 0.12));
+                } else {
+                    osc.frequency.setValueAtTime(f2, when);
+                }
+                osc.detune.setValueAtTime(o.detune || 0, when);
+                attachMods(pitchMods, osc.detune);
+                var og = ctx.createGain();
+                og.gain.value = o.level;
+                osc.connect(og);
+                og.connect(cu);
+                osc.start(when);
+                osc.stop(when + stopAt);
             }
-            if (o.detune) osc.detune.setValueAtTime(o.detune, when);
-            var og = ctx.createGain();
-            og.gain.value = o.level;
-            osc.connect(og);
-            og.connect(bus);
-            osc.start(when);
-            osc.stop(when + stopAt);
         }
         if (def.noise && def.noise.level > 0) {
             var src = ctx.createBufferSource();
@@ -1627,7 +1974,7 @@
         var t0 = loop.occT0;
         if (d.kind === "drum") {
             var cue = visualCues.get(String(d.voice));
-            var voiceOut = audioOut(d.voice);
+            var voiceOut = loop.chain ? loop.chain.input : audioOut(d.voice);
             var steps = d.steps || [];
             for (var i = 0; i < steps.length; i++) {
                 var off = i * ratio;
@@ -1641,7 +1988,7 @@
         } else if (d.kind === "note") {
             var cueN = visualCues.get(String(d.instrument));
             var noteColor = colorFor(d.instrument);
-            var noteOut = audioOut(d.instrument);
+            var noteOut = loop.chain ? loop.chain.input : audioOut(d.instrument);
             var notes = d.notes || [];
             for (var j = 0; j < notes.length; j++) {
                 var n = notes[j];
@@ -1651,6 +1998,28 @@
                     var durN = Math.max(0.05, n.length * cellSpan);
                     noteHit(d.instrument, n.pitch, whenN, durN, n.velocity * loop.volume, noteOut);
                     if (cueN) vizQueue.push({ loop: loop, t: whenN, effect: cueN, voice: d.instrument, midi: n.pitch, color: noteColor, dur: durN, vel: n.velocity, src: d.id ? String(d.id) : null });
+                }
+            }
+        } else if (d.kind === "arp") {
+            var cueA = visualCues.get(String(d.instrument));
+            var arpColor = colorFor(d.instrument);
+            var arpOut = loop.chain ? loop.chain.input : audioOut(d.instrument);
+            var seq = d.seq || [];
+            if (seq.length) {
+                var gridA = (d.bar_length || 1) * (d.steps_per_bar || 16);
+                var stepA = Math.max(0.25, Number(d.step) || 1);
+                var gateA = d.gate == null ? 0.5 : d.gate;
+                var velA = d.velocity == null ? 0.8 : d.velocity;
+                var cntA = Math.floor(gridA / stepA + 0.001);
+                for (var q = 0; q < cntA; q++) {
+                    var offA = (q * stepA + (d.offset || 0)) % gridA;
+                    if (offA >= from && offA < to) {
+                        var whenA = t0 + offA * cellSpan;
+                        var durA = Math.max(0.04, stepA * gateA * cellSpan);
+                        var midiA = seq[q % seq.length];
+                        noteHit(d.instrument, midiA, whenA, durA, velA * loop.volume, arpOut);
+                        if (cueA) vizQueue.push({ loop: loop, t: whenA, effect: cueA, voice: d.instrument, midi: midiA, color: arpColor, dur: durA, vel: velA, src: d.id ? String(d.id) : null });
+                    }
                 }
             }
         }
@@ -1673,10 +2042,16 @@
             return;
         }
         var wanted = {};
-        (sec.layers || []).forEach(function (l) { wanted[String(l.name)] = l.volume == null ? 1 : l.volume; });
+        (sec.layers || []).forEach(function (l) { wanted[String(l.name)] = { volume: l.volume == null ? 1 : l.volume, pan: l.pan }; });
         loops.forEach(function (e, id) {
             if (wanted[id] != null) {
-                e.volume = clamp01(wanted[id]);
+                e.volume = clamp01(wanted[id].volume);
+                /* section pan overrides the loop's own; absent means fall back */
+                e.panOv = wanted[id].pan == null ? null : Math.max(-1, Math.min(1, Number(wanted[id].pan)));
+                if (e.chain && e.chain.pan) {
+                    var pv = e.panOv == null ? Number((e.def && e.def.pan) || 0) : e.panOv;
+                    try { e.chain.pan.pan.linearRampToValueAtTime(pv, ctx.currentTime + 0.08); } catch (x) {}
+                }
                 if (!e.playing) {
                     e.playing = true;
                     e.nextStep = step;
@@ -1744,7 +2119,11 @@
             var to = Math.min(horizonStep, occEnd, stopAt);
             if (loop.sched < to) {
                 /* one bad definition must not stall every other loop */
-                try { scheduleOccurrence(loop, loop.sched - loop.nextStep, to - loop.nextStep); }
+                try {
+                    ensureChain(loop);
+                    scheduleOccurrence(loop, loop.sched - loop.nextStep, to - loop.nextStep);
+                    scheduleDucks(loop, loop.sched - loop.nextStep, to - loop.nextStep);
+                }
                 catch (e) {
                     if (!loop.errored) {
                         loop.errored = true;
@@ -1771,6 +2150,7 @@
         id = String(id || def.id || ("local_" + (++localSeq)));
         var existing = loops.get(id);
         if (!existing && countPlaying() >= MAX_LAYERS) return null;
+        if (existing) destroyChain(existing);
         def.id = id;
         loops.set(id, {
             def: def,
@@ -1836,6 +2216,12 @@
                 ent.gain.connect(ent.analyser);
             } catch (e) {}
         });
+        /* loop chains hang on the duck tail: re-attach so they reach the
+           fresh master instead of the muted old one */
+        loops.forEach(function (e) {
+            if (!e.chain) return;
+            try { e.chain.duck.disconnect(); e.chain.duck.connect(master); } catch (x) {}
+        });
         if (verbNode && compNode) {
             setTimeout(function () {
                 if (gen !== localSeq) return;
@@ -1862,6 +2248,13 @@
             bpm = v;
             anchorT = ctx.currentTime;
             anchorS = pos;
+            /* tempo-synced delay taps follow the new grid */
+            loops.forEach(function (e) {
+                if (!e.chain) return;
+                (e.chain.synced || []).forEach(function (s) {
+                    try { s.node.delayTime.setValueAtTime(Math.min(2, s.beats * 60 / v), ctx.currentTime); } catch (x) {}
+                });
+            });
         } else {
             bpm = v;
         }
@@ -1892,7 +2285,10 @@
         remove: function (id) {
             id = String(id);
             var e = loops.get(id);
-            if (e) vizQueue = vizQueue.filter(function (v) { return v.loop !== e; });
+            if (e) {
+                vizQueue = vizQueue.filter(function (v) { return v.loop !== e; });
+                destroyChain(e);
+            }
             loops.delete(id);
             if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.remove(id);
         },
@@ -1967,6 +2363,7 @@
                     voice_or_instrument: e.def ? (e.def.voice || e.def.instrument) : null,
                     bar_length: e.def ? e.def.bar_length : null,
                     steps_per_bar: e.def ? (e.def.steps_per_bar || 16) : null,
+                    pan: e.def ? (e.def.pan || 0) : null,
                     playing: !!e.playing
                 });
             });

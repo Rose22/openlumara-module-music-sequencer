@@ -1,3 +1,4 @@
+import random
 import re
 import time
 import core
@@ -21,6 +22,10 @@ EFFECTS = [
 AMBIENT_EFFECTS = ["wheel", "motes", "vortex", "soundwave"]
 DEFAULT_VISUALS = {"kick": "flash", "snare": "ripple"}
 FILTER_TYPES = ["lowpass", "highpass", "bandpass"]
+LFO_SYNC_RATES = ["bar", "1/1", "1/2", "1/4", "1/8", "1/16", "1/32", "1/4t", "1/8t", "1/16t"]
+DELAY_SYNC_TIMES = ["bar", "1/1", "1/2", "1/4", "1/4d", "1/8", "1/8d", "1/8t", "1/16", "1/16d", "1/16t"]
+FX_TYPES = ["dist", "chorus", "delay", "verb"]
+SIDECHAIN_RATES = ("4th", "8th", "16th")
 SOUND_NAME_RE = re.compile(r"^[a-z][a-z0-9_\-]{0,31}$")
 
 PITCH_RE = re.compile(r"^([A-Ga-g])([#b]?)(-?\d{1,2})$")
@@ -108,6 +113,91 @@ def _num(value, default, lo, hi):
     return max(lo, min(hi, v))
 
 
+def _is_number(value):
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+SIDECHAIN_ALIASES = {
+    "kick": "4th", "quarter": "4th", "4n": "4th",
+    "eighth": "8th", "8n": "8th",
+    "sixteenth": "16th", "16n": "16th",
+}
+
+
+def _clean_sidechain(value):
+    """Sidechain pump spec -> dict | None. Accepts "rate:depth:attack:release"
+    (only rate required) or a dict {rate, depth?, attack?, release?}."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, None
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.split(":") if p.strip()]
+        if not parts:
+            return None, "sidechain is empty after splitting on ':'. Use e.g. '16th', '8th:0.5' or '16th:0.7:0.005:0.12'."
+        value = {"rate": parts[0]}
+        for key, item in zip(("depth", "attack", "release"), parts[1:]):
+            value[key] = item
+    if not isinstance(value, dict):
+        return None, "sidechain must be a string like '16th:0.7:0.005:0.12' or a dict {rate, depth?, attack?, release?}."
+    rname = str(value.get("rate", "")).strip().lower()
+    rname = SIDECHAIN_ALIASES.get(rname, rname)
+    if rname not in SIDECHAIN_RATES:
+        return None, f"sidechain rate must be one of: {', '.join(SIDECHAIN_RATES)} (aliases: kick/quarter, eighth, sixteenth)."
+    return {
+        "rate": rname,
+        "depth": _num(value.get("depth"), 0.65, 0.0, 0.95),
+        "attack": _num(value.get("attack"), 0.006, 0.001, 0.2),
+        "release": _num(value.get("release"), 0.22, 0.02, 2.0),
+    }, None
+
+
+def _clean_fx(value):
+    """Per-loop FX chain spec -> list of cleaned stage dicts | None."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None, None
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list) or not value or len(value) > 4:
+        return None, "fx must be a list of 1 to 4 stage dicts, each with a 'type' key."
+    clean = []
+    for i, stage in enumerate(value):
+        if not isinstance(stage, dict):
+            return None, f"fx[{i}] must be a dict with a 'type' key."
+        t = str(stage.get("type", "")).strip().lower()
+        if t not in FX_TYPES:
+            return None, f"fx[{i}].type must be one of: {', '.join(FX_TYPES)}."
+        s = {"type": t}
+        if t == "dist":
+            curve = str(stage.get("curve", "tanh")).strip().lower()
+            if curve not in ("tanh", "fold", "crush", "hard"):
+                return None, f"fx[{i}].curve must be one of: tanh, fold, crush, hard."
+            s["curve"] = curve
+            s["drive"] = _num(stage.get("drive"), 0.5, 0.0, 1.0)
+            s["mix"] = _num(stage.get("mix"), 1.0, 0.0, 1.0)
+            s["bits"] = int(_num(stage.get("bits"), 5, 1, 8))
+        elif t == "chorus":
+            s["rate"] = _num(stage.get("rate"), 0.6, 0.05, 4.0)
+            s["depth"] = _num(stage.get("depth"), 0.5, 0.0, 1.0)
+            s["mix"] = _num(stage.get("mix"), 0.4, 0.0, 1.0)
+        elif t == "delay":
+            sync = str(stage.get("sync", "1/4")).strip()
+            if sync not in DELAY_SYNC_TIMES:
+                return None, f"fx[{i}].sync must be one of: {', '.join(DELAY_SYNC_TIMES)} (or set time in seconds)."
+            s["sync"] = sync
+            s["time"] = _num(stage.get("time"), 0.0, 0.0, 2.0)
+            s["feedback"] = _num(stage.get("feedback"), 0.35, 0.0, 0.92)
+            s["mix"] = _num(stage.get("mix"), 0.3, 0.0, 1.0)
+            s["damp"] = _num(stage.get("damp"), 4500.0, 200.0, 16000.0)
+            s["pingpong"] = bool(stage.get("pingpong", False))
+        elif t == "verb":
+            s["mix"] = _num(stage.get("mix"), 0.3, 0.0, 1.0)
+        clean.append(s)
+    return clean, None
+
+
 def _clean_fm(fm):
     if not isinstance(fm, dict):
         return None, "spec.fm must be a dict."
@@ -173,13 +263,13 @@ def _clean_sound_spec(spec):
         fm, err = _clean_fm(spec["fm"])
         if err:
             return None, err
-    engine_keys = ("fm", "pd", "ring", "wt", "chip", "grain")
+    engine_keys = ("fm", "pd", "ring", "wt", "chip", "grain", "sweep")
     osc = spec.get("osc")
     has_engine = any(spec.get(e) is not None for e in engine_keys)
     if osc is None and has_engine:
         osc = []
     if not isinstance(osc, list) or len(osc) > 4 or (not osc and not has_engine):
-        return None, "spec.osc must be a list of 1 to 4 oscillator layers (empty only when an engine key is set: fm, pd, ring, wt, chip or grain)."
+        return None, "spec.osc must be a list of 1 to 4 oscillator layers (empty only when an engine key is set: fm, pd, ring, wt, chip, grain or sweep)."
     clean_osc = []
     for i, layer in enumerate(osc):
         if not isinstance(layer, dict):
@@ -217,23 +307,39 @@ def _clean_sound_spec(spec):
         ftype = str(f.get("type", "lowpass")).strip().lower()
         if ftype not in FILTER_TYPES:
             return None, f"spec.filter.type must be one of: {', '.join(FILTER_TYPES)}."
-        clean["filter"] = {
+        filt = {
             "type": ftype,
             "cutoff": _num(f.get("cutoff"), 8000.0, 20.0, 20000.0),
             "q": _num(f.get("q"), 1.0, 0.0001, 30.0),
-            "env": _num(f.get("env"), 0.0, -48.0, 48.0),
-            "env_time": _num(f.get("env_time"), 0.2, 0.01, 2.0),
+            "poles": int(_num(f.get("poles"), 1, 1, 2)),
+            "keytrack": _num(f.get("keytrack"), 0.0, 0.0, 1.0),
         }
+        fenv = f.get("env", 0.0)
+        if isinstance(fenv, dict):
+            # full filter envelope in semitones relative to cutoff: start at
+            # 'from', optional attack hold, then travel to 'to' across decay.
+            filt["env"] = {
+                "from": _num(fenv.get("from"), 24.0, -60.0, 60.0),
+                "to": _num(fenv.get("to"), 0.0, -60.0, 60.0),
+                "attack": _num(fenv.get("attack"), 0.0, 0.0, 8.0),
+                "decay": _num(fenv.get("decay"), 0.3, 0.01, 8.0),
+            }
+        else:
+            # legacy one-shot: start 'env' semitones above cutoff, fall to it.
+            filt["env"] = _num(fenv, 0.0, -48.0, 48.0)
+            filt["env_time"] = _num(f.get("env_time"), 0.2, 0.01, 8.0)
+        clean["filter"] = filt
 
     if spec.get("env") is not None:
         e = spec["env"]
         if not isinstance(e, dict):
             return None, "spec.env must be a dict."
         clean["env"] = {
-            "attack": _num(e.get("attack"), 0.005, 0.001, 2.0),
-            "decay": _num(e.get("decay"), 0.3, 0.005, 4.0),
+            # long attack/decay headroom for risers and swelling pads
+            "attack": _num(e.get("attack"), 0.005, 0.001, 10.0),
+            "decay": _num(e.get("decay"), 0.3, 0.005, 12.0),
             "sustain": _num(e.get("sustain"), 0.0, 0.0, 1.0),
-            "release": _num(e.get("release"), 0.15, 0.005, 4.0),
+            "release": _num(e.get("release"), 0.15, 0.005, 8.0),
         }
 
     if spec.get("pitch") is not None:
@@ -268,11 +374,23 @@ def _clean_sound_spec(spec):
         w = spec["wt"]
         if not isinstance(w, dict):
             return None, "spec.wt must be a dict."
-        table = str(w.get("table", "basic")).strip().lower()
-        if table not in WT_TABLES:
-            return None, f"spec.wt.table must be one of: {', '.join(WT_TABLES)}."
+        wtabs = w.get("table", "basic")
+        if isinstance(wtabs, list):
+            # custom table: per-harmonic amplitudes, index 0 = fundamental;
+            # negative values flip that partial's phase.
+            if not wtabs or len(wtabs) > 64:
+                return None, "spec.wt.table as a custom table must be 1 to 64 harmonic amplitudes (index 0 = fundamental)."
+            amps = [_num(x, 0.0, -1.0, 1.0) for x in wtabs]
+            while len(amps) > 1 and abs(amps[-1]) < 0.0005:
+                amps.pop()
+            wtable = amps
+        else:
+            tname = str(wtabs).strip().lower()
+            if tname not in WT_TABLES:
+                return None, f"spec.wt.table must be one of: {', '.join(WT_TABLES)} (or a list of harmonic amplitudes)."
+            wtable = tname
         clean["wt"] = {
-            "table": table,
+            "table": wtable,
             "pos_start": _num(w.get("pos_start"), 0.05, 0.0, 1.0),
             "pos_end": _num(w.get("pos_end"), 0.9, 0.0, 1.0),
             "steps": int(_num(w.get("steps"), 16, 1, 64)),
@@ -280,6 +398,7 @@ def _clean_sound_spec(spec):
             "curve": _num(w.get("curve"), 1.0, 0.2, 5.0),
             "unison": int(_num(w.get("unison"), 0, 0, 8)),
             "detune": _num(w.get("detune"), 0.12, 0.0, 1.0),
+            "spread": _num(w.get("spread"), 0.5, 0.0, 1.0),
         }
         if w.get("lfo") is not None:
             l = w["lfo"]
@@ -329,6 +448,69 @@ def _clean_sound_spec(spec):
             "scatter": _num(g.get("scatter"), 0.015, 0.0, 0.2),
             "src": src,
         }
+
+    if spec.get("lfo") is not None:
+        lfos = spec["lfo"] if isinstance(spec["lfo"], list) else [spec["lfo"]]
+        if not lfos or len(lfos) > 4:
+            return None, "spec.lfo must be one LFO dict or a list of up to 4."
+        clean_lfos = []
+        for i, l in enumerate(lfos):
+            if not isinstance(l, dict):
+                return None, f"spec.lfo[{i}] must be a dict."
+            tgt = str(l.get("target", "pitch")).strip().lower()
+            if tgt not in ("pitch", "cutoff", "amp"):
+                return None, "spec.lfo.target must be 'pitch' (vibrato), 'cutoff' (filter wobble/squelch) or 'amp' (tremolo/rhythmic gating)."
+            wave = str(l.get("wave", "sine")).strip().lower()
+            if wave not in ("sine", "triangle", "square", "sawtooth"):
+                return None, "spec.lfo.wave must be one of: sine, triangle, square, sawtooth."
+            rate = l.get("rate", "1/8")
+            if isinstance(rate, str) and not _is_number(rate):
+                rname = rate.strip().lower()
+                if rname not in LFO_SYNC_RATES:
+                    return None, f"spec.lfo.rate {rate!r} is neither a Hz number nor a tempo-sync name: {', '.join(LFO_SYNC_RATES)}."
+                rate = rname
+            else:
+                rate = _num(rate, 5.0, 0.05, 40.0)
+            clean_lfos.append({
+                "target": tgt,
+                "wave": wave,
+                "rate": rate,
+                "depth": _num(l.get("depth"), 0.5, 0.0, 1.0),
+                "delay": _num(l.get("delay"), 0.0, 0.0, 8.0),
+            })
+        clean["lfo"] = clean_lfos
+
+    if spec.get("unison") is not None:
+        u = spec["unison"]
+        if not isinstance(u, dict):
+            return None, "spec.unison must be a dict."
+        clean["unison"] = {
+            "voices": int(_num(u.get("voices"), 3, 1, 8)),
+            "detune": _num(u.get("detune"), 0.5, 0.0, 1.0),
+            "spread": _num(u.get("spread"), 0.7, 0.0, 1.0),
+        }
+
+    if spec.get("sweep") is not None:
+        s = spec["sweep"]
+        if not isinstance(s, dict):
+            return None, "spec.sweep must be a dict."
+        ssrc = str(s.get("src", "noise")).strip().lower()
+        if ssrc not in ("noise", "sine", "square", "sawtooth", "triangle"):
+            return None, "spec.sweep.src must be noise, sine, square, sawtooth or triangle."
+        sweep = {
+            "src": ssrc,
+            "from": _num(s.get("from"), 0.0, 0.0, 20000.0),
+            "to": _num(s.get("to"), 0.0, 0.0, 20000.0),
+            "curve": _num(s.get("curve"), 1.0, 0.2, 5.0),
+            "level": _num(s.get("level"), 0.4, 0.0, 1.0),
+        }
+        if ssrc == "noise":
+            sfilter = str(s.get("filter", "lowpass")).strip().lower()
+            if sfilter not in FILTER_TYPES:
+                return None, f"spec.sweep.filter must be one of: {', '.join(FILTER_TYPES)}."
+            sweep["filter"] = sfilter
+            sweep["q"] = _num(s.get("q"), 1.2, 0.0001, 12.0)
+        clean["sweep"] = sweep
     return clean, None
 
 
@@ -548,7 +730,7 @@ class MusicSequencerModule(core.module.Module):
     # -------------------------
 
     @core.module.tool
-    async def play_drum_pattern(self, name: str, steps: list, bar_length: int = 1, subdivision: str = "", voice: str = "kick", volume: float = 1.0):
+    async def play_drum_pattern(self, name: str, steps: list, bar_length: int = 1, subdivision: str = "", voice: str = "kick", volume: float = 1.0, pan: float = 0.0, sidechain: str = "", fx: list = None):
         """
         Launches a named drum loop on the shared transport, joining at the next
         restart of the longest playing loop so it lands aligned with the other
@@ -565,6 +747,9 @@ class MusicSequencerModule(core.module.Module):
             subdivision: Cells per bar: '' = the chat meter's 16th grid (16 in 4/4); presets: 4ths, 8ths, 16ths, 32nds, 6/8, triplets (=12, shuffle feel), 12/8, triplet-16ths (=24), double-shuffle. Bars are always meter-long in real time; subdivision only picks how finely each bar is cut.
             voice: Drum voice: kick, snare, clap, hihat_closed, hihat_open, tom, rim, cowbell, or any custom sound name from define_sound.
             volume: Layer volume 0.0-1.0.
+            pan: Stereo position -1 (full left) .. 1 (full right), 0 = center.
+            sidechain: Optional sidechain pump (duck on a fixed grid, e.g. EDM pumping on the kick). "rate:depth:attack:release" - only rate required: "8th", "16th:0.8", "16th:0.7:0.005:0.12". Rate: 4th (=kick/quarter), 8th (eighth), 16th (sixteenth); depth 0-0.95 (default 0.65); attack/release in seconds (defaults 0.006 / 0.22). A dict works too. Empty = no ducking.
+            fx: Optional per-loop FX chain, applied before pan/duck: list of up to 4 stage dicts, each {type, ...}: dist {curve: tanh|fold|crush|hard, drive 0-1, mix 0-1, bits 1-8 (crush)}; chorus {rate Hz 0.05-4, depth 0-1, mix 0-1}; delay {sync: bar|1/1|1/2|1/4|1/4d|1/8|1/8d|1/8t|1/16|1/16d|1/16t (tempo-synced) OR time 0-2 s (0 = use sync), feedback 0-0.92, mix 0-1, damp Hz 200-16000, pingpong bool}; verb {mix 0-1}. E.g. [{"type": "delay", "sync": "1/8", "feedback": 0.4, "mix": 0.25}].
         """
         chat_id = self._chat_id()
         if not chat_id:
@@ -610,6 +795,12 @@ class MusicSequencerModule(core.module.Module):
         target = bars * spb
         tiled = len(pattern) != target
         pattern = (pattern * (target // len(pattern) + 1))[:target]
+        sc, sc_err = _clean_sidechain(sidechain)
+        if sc_err:
+            return self.result(sc_err, success=False)
+        fxs, fx_err = _clean_fx(fx)
+        if fx_err:
+            return self.result(fx_err, success=False)
 
         definition = {
             "kind": "drum",
@@ -620,6 +811,13 @@ class MusicSequencerModule(core.module.Module):
             "volume": _velocity(volume, 1.0),
             "playing": True,
         }
+        panv = _num(pan, 0.0, -1.0, 1.0)
+        if panv:
+            definition["pan"] = panv
+        if sc:
+            definition["sidechain"] = sc
+        if fxs:
+            definition["fx"] = fxs
         loops = dict(self._loops(chat_id))
         loops[loop_id] = definition
         self._store_loops(chat_id, loops)
@@ -632,7 +830,7 @@ class MusicSequencerModule(core.module.Module):
         )
 
     @core.module.tool
-    async def play_note_pattern(self, name: str, notes: list, bar_length: int = 1, subdivision: str = "", instrument: str = "piano", volume: float = 1.0, key: str = "C major"):
+    async def play_note_pattern(self, name: str, notes: list, bar_length: int = 1, subdivision: str = "", instrument: str = "piano", volume: float = 1.0, key: str = "C major", pan: float = 0.0, sidechain: str = "", fx: list = None):
         """
         Launches a named piano-roll melody loop on the shared transport,
         joining at the next restart of the longest playing loop so its
@@ -649,6 +847,9 @@ class MusicSequencerModule(core.module.Module):
             instrument: Timbre: piano, bass, pad, lead, pluck, bells, sine, square, triangle, saw, organ, strings, synbrass, flute, musicbox, or any custom sound name from define_sound.
             volume: Layer volume 0.0-1.0.
             key: Scale of the loop as root note + scale name; the root may carry an octave (default 4). E.g. "A minor", "F# dorian", "C3 major pentatonic". Common: major, minor, harmonic/melodic minor, harmonic major, dorian, phrygian, lydian, mixolydian, locrian, whole tone, hirajoshi, octatonic, major/minor pentatonic, blues - plus every derived mode (phrygian dominant, lydian dominant, altered, ukrainian dorian, ...). An invalid name returns the full list of options.
+            pan: Stereo position -1 (full left) .. 1 (full right), 0 = center.
+            sidechain: Optional sidechain pump (duck on a fixed grid, e.g. EDM pumping on the kick). "rate:depth:attack:release" - only rate required: "8th", "16th:0.8", "16th:0.7:0.005:0.12". Rate: 4th (=kick/quarter), 8th (eighth), 16th (sixteenth); depth 0-0.95 (default 0.65); attack/release in seconds (defaults 0.006 / 0.22). A dict works too. Empty = no ducking.
+            fx: Optional per-loop FX chain, applied before pan/duck: list of up to 4 stage dicts, each {type, ...}: dist {curve: tanh|fold|crush|hard, drive 0-1, mix 0-1, bits 1-8 (crush)}; chorus {rate Hz 0.05-4, depth 0-1, mix 0-1}; delay {sync: bar|1/1|1/2|1/4|1/4d|1/8|1/8d|1/8t|1/16|1/16d|1/16t (tempo-synced) OR time 0-2 s (0 = use sync), feedback 0-0.92, mix 0-1, damp Hz 200-16000, pingpong bool}; verb {mix 0-1}. E.g. [{"type": "verb", "mix": 0.35}, {"type": "delay", "sync": "1/8", "feedback": 0.4}].
         """
         chat_id = self._chat_id()
         if not chat_id:
@@ -710,6 +911,13 @@ class MusicSequencerModule(core.module.Module):
                 "velocity": _velocity(n[3], 0.8) if len(n) > 3 else 0.8,
             })
 
+        sc, sc_err = _clean_sidechain(sidechain)
+        if sc_err:
+            return self.result(sc_err, success=False)
+        fxs, fx_err = _clean_fx(fx)
+        if fx_err:
+            return self.result(fx_err, success=False)
+
         definition = {
             "kind": "note",
             "instrument": instrument,
@@ -720,6 +928,13 @@ class MusicSequencerModule(core.module.Module):
             "volume": _velocity(volume, 1.0),
             "playing": True,
         }
+        panv = _num(pan, 0.0, -1.0, 1.0)
+        if panv:
+            definition["pan"] = panv
+        if sc:
+            definition["sidechain"] = sc
+        if fxs:
+            definition["fx"] = fxs
         loops = dict(self._loops(chat_id))
         loops[loop_id] = definition
         self._store_loops(chat_id, loops)
@@ -728,6 +943,136 @@ class MusicSequencerModule(core.module.Module):
         return self.result(
             f"Started {instrument} melody loop '{loop_id}' ({len(clean_notes)} notes, {bars} bar{'s' if bars > 1 else ''}, "
             f"{self._playing_count(chat_id)}/{MAX_LAYERS} layers live).{note}",
+            success=True,
+        )
+
+    @core.module.tool
+    async def play_arp(self, name: str, chord: list, mode: str = "up", rate: int = 1, octaves: int = 2, gate: float = 0.5, bar_length: int = 1, subdivision: str = "", instrument: str = "pluck", volume: float = 1.0, key: str = "C major", velocity: float = 0.8, offbeat: bool = False, pan: float = 0.0, sidechain: str = "", fx: list = None):
+        """
+        Launches a named arpeggiator loop on the shared transport: it cycles a
+        chord note-by-note at a fixed grid rate, joining like the other loops.
+        Great for trance/EDM up-arp risers, gating patterns and bubbling bass.
+
+        Args:
+            name: Unique name for this loop (letters, digits, spaces, '-' or '_', max 40 chars); duplicates are rejected.
+            chord: Chord tones as scale degrees (1, 3, 5; '#4'/'b7' altered) or absolute note names ('C4'), max 8. Played over the loop's key, e.g. [1, 3, 5, 7] = 7th chord.
+            mode: Traversal: 'up', 'down', 'updown' (ping-pong, descending without repeating the top/bottom note) or 'random'.
+            rate: Grid cells per arp note (1-8): 1 = a 16th-note run on the default grid, 2 = 8ths, 4 = quarters.
+            octaves: How many octaves the sequence spans (1-4), from the chord's lowest tone up.
+            gate: Note length as a fraction of the arp step (0.05-1): 0.5 = bouncy stabs, 1 = legato.
+            bar_length: Length of the loop in bars (1-32).
+            subdivision: Cells per bar: '' = the chat meter's 16th grid (16 in 4/4); presets: 4ths, 8ths, 16ths, 32nds, 6/8, triplets (=12, shuffle feel), 12/8, triplet-16ths (=24), double-shuffle.
+            instrument: Timbre: piano, bass, pad, lead, pluck, bells, sine, square, triangle, saw, organ, strings, synbrass, flute, musicbox, fm, or any custom sound name from define_sound.
+            volume: Layer volume 0.0-1.0.
+            key: Scale the chord degrees resolve against, e.g. "A minor". Same format as play_note_pattern.
+            velocity: Per-note velocity 0.0-1.0 (default 0.8).
+            offbeat: Offset the whole run by half an arp step (classic offbeat trance bass/arp stab).
+            pan: Stereo position -1 (full left) .. 1 (full right), 0 = center.
+            sidechain: Optional sidechain pump. "rate:depth:attack:release" - only rate required: "8th", "16th:0.8". Rate: 4th/8th/16th (aliases kick/quarter, eighth, sixteenth); depth 0-0.95 (default 0.65); attack/release seconds (defaults 0.006 / 0.22). Empty = no ducking.
+            fx: Optional per-loop FX chain: list of up to 4 stage dicts {type, ...} - dist {curve: tanh|fold|crush|hard, drive, mix, bits}, chorus {rate, depth, mix}, delay {sync or time, feedback, mix, damp, pingpong}, verb {mix}. Same format as play_note_pattern.
+        """
+        chat_id = self._chat_id()
+        if not chat_id:
+            return self.result("No active chat.", success=False)
+        if self._song_busy(chat_id):
+            return self.result("A song is playing - call stop_song first to use free loop mode.", success=False)
+        loop_id = _norm_name(name)
+        if not loop_id:
+            return self.result("name is required: 1-40 chars of letters, digits, spaces, '-' or '_'.", success=False)
+        if loop_id in self._loops(chat_id):
+            return self.result(f"A loop named '{loop_id}' already exists. remove_loop it first, or pick another name.", success=False)
+        instrument = str(instrument).strip().lower()
+        if instrument not in INSTRUMENTS and instrument not in self._sounds(chat_id):
+            custom = ", ".join(sorted(self._sounds(chat_id))) or "none defined"
+            return self.result(f"Unknown instrument '{instrument}'. Built-in: {', '.join(INSTRUMENTS)}. Custom: {custom}.", success=False)
+        mname = str(mode).strip().lower()
+        if mname not in ("up", "down", "updown", "random"):
+            return self.result("mode must be 'up', 'down', 'updown' or 'random'.", success=False)
+        try:
+            bars = int(bar_length)
+            octs = int(octaves)
+            step = int(rate)
+        except (TypeError, ValueError):
+            return self.result("bar_length, octaves and rate must be integers.", success=False)
+        if bars < 1 or bars > MAX_BAR_LENGTH:
+            return self.result(f"bar_length must be between 1 and {MAX_BAR_LENGTH}.", success=False)
+        if octs < 1 or octs > 4:
+            return self.result("octaves must be between 1 and 4.", success=False)
+        if not isinstance(chord, list) or not chord or len(chord) > 8:
+            return self.result("chord must be a list of 1 to 8 scale degrees or note names.", success=False)
+        if self._playing_count(chat_id) >= MAX_LAYERS:
+            return self.result(f"Cannot start: {MAX_LAYERS} layers are already playing. Stop one first.", success=False)
+        root_midi, scale, scale_name, key_err = _parse_key(key)
+        if key_err:
+            return self.result(key_err, success=False)
+        spb, sub_err = self._resolve_subdivision(subdivision, chat_id)
+        if sub_err:
+            return self.result(sub_err, success=False)
+        sc, sc_err = _clean_sidechain(sidechain)
+        if sc_err:
+            return self.result(sc_err, success=False)
+        fxs, fx_err = _clean_fx(fx)
+        if fx_err:
+            return self.result(fx_err, success=False)
+
+        # the chord collapses to pitch classes, then unrolls up through the
+        # requested octave range: one ascending run the mode then traverses.
+        pcs = []
+        for i, tone in enumerate(chord):
+            midi = _resolve_pitch(tone, root_midi, scale)
+            if midi is None:
+                return self.result(f"Chord tone {i} is invalid ({tone!r}). Use a scale degree (1, 3, '#5') or a note name like C4.", success=False)
+            pc = (midi - root_midi) % 12
+            if pc not in pcs:
+                pcs.append(pc)
+        pcs.sort()
+        seq = []
+        for o in range(octs):
+            for pc in pcs:
+                midi = root_midi + o * 12 + pc
+                if 12 <= midi <= 127:
+                    seq.append(midi)
+        if mname == "down":
+            seq = seq[::-1]
+        elif mname == "updown":
+            seq = seq + seq[-2:0:-1]
+        elif mname == "random":
+            random.shuffle(seq)
+        grid = bars * spb
+        step = max(1, min(8, step))
+        if step > grid:
+            step = grid
+        gatev = _num(gate, 0.5, 0.05, 1.0)
+
+        definition = {
+            "kind": "arp",
+            "instrument": instrument,
+            "bar_length": bars,
+            "steps_per_bar": spb,
+            "key": f"{SHARP_NAMES[root_midi % 12]}{root_midi // 12 - 1} {scale_name}",
+            "arp_mode": mname,
+            "seq": seq,
+            "step": step,
+            "offset": step / 2 if offbeat else 0,
+            "gate": gatev,
+            "velocity": _velocity(velocity, 0.8),
+            "volume": _velocity(volume, 1.0),
+            "playing": True,
+        }
+        panv = _num(pan, 0.0, -1.0, 1.0)
+        if panv:
+            definition["pan"] = panv
+        if sc:
+            definition["sidechain"] = sc
+        if fxs:
+            definition["fx"] = fxs
+        loops = dict(self._loops(chat_id))
+        loops[loop_id] = definition
+        self._store_loops(chat_id, loops)
+        await self._push(chat_id, {"type": "music_sequencer:play", "loop": dict(definition, id=loop_id)})
+        return self.result(
+            f"Started {mname} arp loop '{loop_id}' ({len(seq)} notes/occurrence every {step} step{'s' if step > 1 else ''}, "
+            f"{instrument}, {self._playing_count(chat_id)}/{MAX_LAYERS} layers live).",
             success=True,
         )
 
@@ -877,7 +1222,7 @@ class MusicSequencerModule(core.module.Module):
     async def list_loops(self):
         """
         Lists this chat's loop layers: IDs, kind, voice/instrument, bar length,
-        volume, and whether each one is currently playing.
+        volume, pan/sidechain/FX routing, and whether each one is currently playing.
         """
         chat_id = self._chat_id()
         if not chat_id:
@@ -897,6 +1242,17 @@ class MusicSequencerModule(core.module.Module):
             if d.get("kind") == "note":
                 entry["note_count"] = len(d.get("notes", []))
                 entry["key"] = d.get("key")
+            if d.get("kind") == "arp":
+                entry["key"] = d.get("key")
+                entry["arp"] = f"{d.get('arp_mode')} x{len(d.get('seq', []))} every {d.get('step')} step(s), gate {d.get('gate')}"
+                if d.get("offset"):
+                    entry["offbeat"] = True
+            if d.get("pan"):
+                entry["pan"] = d["pan"]
+            if d.get("sidechain"):
+                entry["sidechain"] = d["sidechain"]["rate"]
+            if d.get("fx"):
+                entry["fx"] = [s["type"] for s in d["fx"]]
             summary.append(entry)
         return self.result({
             "tempo": self._tempo(chat_id),
@@ -936,7 +1292,7 @@ class MusicSequencerModule(core.module.Module):
 
         Args:
             title: Song name for display.
-            sections: Ordered arrangement; each {name?, bars, layers}. bars: 1-64 meter bars. layers: loops active in that section - each entry a loop name, or {"loop": name, "volume": 0.0-1.0}; an empty list is a break. Max 512 bars total. E.g. [{"name": "intro", "bars": 4, "layers": ["pad"]}, {"name": "verse", "bars": 8, "layers": ["pad", "kick groove", {"loop": "bassline", "volume": 0.7}]}, {"name": "chorus", "bars": 8, "layers": ["pad", "kick groove", "bassline", "lead melody"]}]
+            sections: Ordered arrangement; each {name?, bars, layers}. bars: 1-64 meter bars. layers: loops active in that section - each entry a loop name, or {"loop": name, "volume": 0.0-1.0, "pan": -1..1}; a section pan overrides the loop's own pan (absent = keep the loop's), and can move a layer mid-song. An empty list is a break. Max 512 bars total. E.g. [{"name": "intro", "bars": 4, "layers": ["pad"]}, {"name": "verse", "bars": 8, "layers": ["pad", "kick groove", {"loop": "bassline", "volume": 0.7}]}, {"name": "chorus", "bars": 8, "layers": ["pad", "kick groove", "bassline", {"loop": "lead melody", "pan": -0.6}]}]
             loop: Repeat the arrangement forever instead of ending after the final section.
         """
         chat_id = self._chat_id()
@@ -970,7 +1326,10 @@ class MusicSequencerModule(core.module.Module):
                 if lname not in loops:
                     avail = ", ".join(sorted(loops)) or "none defined"
                     return self.result(f"Section {i} references unknown loop '{lname}'. Available: {avail}.", success=False)
-                clean_layers.append({"name": lname, "volume": _velocity(l.get("volume", 1.0), 1.0) if isinstance(l, dict) else 1.0})
+                entry = {"name": lname, "volume": _velocity(l.get("volume", 1.0), 1.0) if isinstance(l, dict) else 1.0}
+                if isinstance(l, dict) and l.get("pan") is not None:
+                    entry["pan"] = _num(l.get("pan"), 0.0, -1.0, 1.0)
+                clean_layers.append(entry)
             clean_sections.append({"name": str(s.get("name") or "").strip() or f"Part {i + 1}", "bars": bars, "layers": clean_layers})
         self._store_loops(chat_id, {lid: dict(d, playing=False) for lid, d in loops.items()})
         await self._push(chat_id, {"type": "music_sequencer:stop_all"})
@@ -1130,7 +1489,7 @@ class MusicSequencerModule(core.module.Module):
 
         Args:
             name: Lowercase id, e.g. 'pew' or 'wobble'. Cannot shadow a built-in name.
-            spec: Recipe dict. Keys (only osc is required, unless an engine key - fm, pd, ring, wt, chip or grain - is set): osc: list of 1-4 layers [{type: sine|square|sawtooth|triangle, level?: 0-1, octave?: -3..3, detune?: cents -100..100}]; fm?: full FM synth patch {operators: 1-6 dicts [{ratio?: 0.25-32 freq ratio to the played note, level?: 0-1 (mod depth for modulators, amp for carriers), feedback?: 0-0.9 self-modulation, attack?, decay?, sustain?: 0-1, release?}], algorithm: {modulator_index: carrier_index or list}, output: [carrier indexes]} - modulation depth scales with pitch like real FM; can coexist with osc layers; pd?: phase distortion, Casio CZ flavour {shape?: 0.02-0.98 warp (0.05 saw-bright, 0.5 hollow), shape_end?: settle target, decay?: settle seconds}; ring?: ring modulator over the whole voice {ratio?: mod freq relative to note (default 1.5) or freq?: absolute Hz} - stacks with any other engine, alone gets a sine carrier; wt?: wavetable {table?: basic|saw|even|odd|quad|sparse|bell|vocal|organ|harmonics, pos_start?: 0-1, pos_end?: 0-1, steps?: 1-64, pos_time?: seconds, curve?: 0.2-5 sweep slope, unison?: 0-8 detuned voices, detune?: 0-1 spread, lfo?: {rate?: Hz 0.05-40 (default 5), depth?: 0-1, target?: pos|pitch, wave?: sine|triangle|square}}; tables are band-limited per note (no aliasing at any pitch); odd unison is rounded up to keep the stack symmetrical; with lfo target=pos the table wobbles back and forth between pos_start and pos_end (depth scales the excursion around the midpoint; replaces the one-shot sweep) - that's the dubstep wobble; target=pitch vibrates pitch instead (depth 1 = one semitone); chip?: NES pulse voice {duty?: 0.03-0.5, duty_end?: sweep target, arp?: up to 8 semitone offsets cycled as chip arpeggio, arp_rate?: 1-100 steps/s}; grain?: granular cloud of the note {size?: grain s (default 0.08), rate?: grains/s (default 14), scatter?: pitch jitter 0-0.2, src?: sine|noise}; noise?: {level?: 0-1, filter?: lowpass|highpass|bandpass, freq?: 20-20000} blended noise layer; filter?: {type?: lowpass|highpass|bandpass, cutoff?: 20-20000, q?: 0-30, env?: sweep start offset in semitones above the cutoff, positive = falling sweep (-48..48), env_time?: seconds} - env around 24-36 gives classic plucks; env?: {attack?, decay?, sustain? 0-1, release?} in seconds (sustain only heard on held notes; a ping is attack 0.002 decay 0.4 sustain 0, a pad attack 0.3 decay 0.2 sustain 0.8 release 0.5); pitch?: {glide?: start offset in semitones above the note, positive = falling sweep (-36..36), glide_time?: seconds}; base_note?: MIDI number used as a drum voice (default 36). E.g. laser: {"osc": [{"type": "sawtooth"}], "pitch": {"glide": 24}, "filter": {"cutoff": 6000, "env": 36}, "env": {"attack": 0.002, "decay": 0.25}, "base_note": 72}
+            spec: Recipe dict. Keys (only osc is required, unless an engine key - fm, pd, ring, wt, chip, grain or sweep - is set): osc: list of 1-4 layers [{type: sine|square|sawtooth|triangle, level?: 0-1, octave?: -3..3, detune?: cents -100..100}]; fm?: full FM synth patch {operators: 1-6 dicts [{ratio?: 0.25-32 freq ratio to the played note, level?: 0-1 (mod depth for modulators, amp for carriers), feedback?: 0-0.9 self-modulation, attack?, decay?, sustain?: 0-1, release?}], algorithm: {modulator_index: carrier_index or list}, output: [carrier indexes]} - modulation depth scales with pitch like real FM; can coexist with osc layers; pd?: phase distortion, Casio CZ flavour {shape?: 0.02-0.98 warp (0.05 saw-bright, 0.5 hollow), shape_end?: settle target, decay?: settle seconds}; ring?: ring modulator over the whole voice {ratio?: mod freq relative to note (default 1.5) or freq?: absolute Hz} - stacks with any other engine, alone gets a sine carrier; wt?: wavetable {table?: basic|saw|even|odd|quad|sparse|bell|vocal|organ|harmonics OR a custom table as a list of 1-64 per-harmonic amplitudes -1..1 (index 0 = fundamental, negative flips that partial's phase, e.g. [1, 0, 0.5, 0, 0.25] = odd harmonics only), pos_start?: 0-1, pos_end?: 0-1, steps?: 1-64, pos_time?: seconds, curve?: 0.2-5 sweep slope, unison?: 0-8 detuned voices, detune?: 0-1, spread?: 0-1 stereo fan, lfo?: {rate?: Hz 0.05-40 (default 5), depth?: 0-1, target?: pos|pitch, wave?: sine|triangle|square}}; tables are band-limited per note (no aliasing at any pitch); odd unison is rounded up to keep the stack symmetrical; with lfo target=pos the table wobbles back and forth between pos_start and pos_end (depth scales the excursion around the midpoint; replaces the one-shot sweep) - that's the dubstep wobble; target=pitch vibrates pitch instead (depth 1 = one semitone); chip?: NES pulse voice {duty?: 0.03-0.5, duty_end?: sweep target, arp?: up to 8 semitone offsets cycled as chip arpeggio, arp_rate?: 1-100 steps/s}; grain?: granular cloud of the note {size?: grain s (default 0.08), rate?: grains/s (default 14), scatter?: pitch jitter 0-0.2, src?: sine|noise}; sweep?: riser/downlifter engine that sweeps across the note's whole gate {src?: noise|sine|square|sawtooth|triangle, from?: Hz, to?: Hz (0/omitted = auto: noise 150->14000 riser; tonal freq/2 -> freq*2), curve?: 0.2-5 rise shape (<1 rushes, >1 blooms), level?: 0-1 (default 0.4), filter?+q?: noise src only}; a long env attack or long notes make the sweep audible - pair with noise layers or use alone for classic white-noise risers; noise?: {level?: 0-1, filter?: lowpass|highpass|bandpass, freq?: 20-20000} blended noise layer; filter?: {type?: lowpass|highpass|bandpass, cutoff?: 20-20000, q?: 0-30, poles?: 1|2 (2 = 24 dB cascade), keytrack?: 0-1 cutoff tracks pitch, env?: sweep offset in semitones relative to cutoff, positive = falling (-48..48), env_time?: seconds, OR env as full dict {from?: -60..60, to?: -60..60, attack?: s, decay?: s} for an up-down filter envelope}; env around 24-36 gives classic plucks; env?: {attack? up to 10s, decay? up to 12s, sustain? 0-1, release? up to 8s} in seconds (sustain only heard on held notes; a ping is attack 0.002 decay 0.4 sustain 0, a pad attack 0.3 decay 0.2 sustain 0.8 release 0.5, a swelling riser attack 4 sustain 1 release 1); pitch?: {glide?: start offset in semitones above the note, positive = falling sweep (-36..36), glide_time?: seconds}; lfo?: one dict or list of up to 4 voice-wide LFOs {target?: pitch (vibrato; depth 1 = a semitone)|cutoff (filter wobble - needs a filter)|amp (tremolo), wave?: sine|triangle|square|sawtooth, rate?: Hz number 0.05-40 OR tempo-sync string (bar, 1/1, 1/2, 1/4, 1/8, 1/16, 1/32, 1/4t, 1/8t, 1/16t), depth?: 0-1, delay?: seconds before it fades in}; unison?: stack the WHOLE engine as detuned voices {voices?: 1-8 (default 3), detune?: 0-1 (default 0.5), spread?: 0-1 stereo fan (default 0.7)} - the supersaw trick on any synth (grain and sweep stay single); base_note?: MIDI number used as a drum voice (default 36). E.g. laser: {"osc": [{"type": "sawtooth"}], "pitch": {"glide": 24}, "filter": {"cutoff": 6000, "env": 36}, "env": {"attack": 0.002, "decay": 0.25}, "base_note": 72}
         """
         chat_id = self._chat_id()
         if not chat_id:
@@ -1248,7 +1607,15 @@ class MusicSequencerModule(core.module.Module):
             key = f", {d['key']}" if d.get("key") else ""
             spb = d.get("steps_per_bar", 16)
             state = "playing" if d.get("playing") else "stopped"
-            lines.append(f"- {loop_id}: {d.get('kind')} ({name}{key}, {d.get('bar_length')} bars @ {spb} steps, vol {d.get('volume')}) - {state}")
+            route = ""
+            if d.get("pan"):
+                route += f", pan {d['pan']:+.2f}"
+            if d.get("sidechain"):
+                route += f", pump {d['sidechain']['rate']}"
+            if d.get("fx"):
+                route += ", fx " + ">".join(s["type"] for s in d["fx"])
+            extra = f" arp {d.get('arp_mode')} every {d.get('step')} step(s)" if d.get("kind") == "arp" else ""
+            lines.append(f"- {loop_id}: {d.get('kind')} ({name}{key}, {d.get('bar_length')} bars @ {spb} steps, vol {d.get('volume')}{route}{extra}) - {state}")
         block = (
             f"Active music_sequencer layers (tempo {self._tempo(chat_id):g} BPM, new-loop meter {self._meter_name(chat_id)}):\n"
             + "\n".join(lines)
@@ -1288,5 +1655,12 @@ class MusicSequencerModule(core.module.Module):
         for loop_id, d in loops.items():
             name = d.get("voice") or d.get("instrument")
             state = "playing" if d.get("playing") else "stopped"
-            lines.append(f"{loop_id}: {d.get('kind')} ({name}, {d.get('bar_length')} bars @ {d.get('steps_per_bar', 16)} steps) - {state}")
+            route = ""
+            if d.get("pan"):
+                route += f", pan {d['pan']:+.2f}"
+            if d.get("sidechain"):
+                route += f", pump {d['sidechain']['rate']}"
+            if d.get("fx"):
+                route += ", fx " + ">".join(s["type"] for s in d["fx"])
+            lines.append(f"{loop_id}: {d.get('kind')} ({name}, {d.get('bar_length')} bars @ {d.get('steps_per_bar', 16)} steps{route}) - {state}")
         return "\n".join(lines)
