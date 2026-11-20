@@ -128,16 +128,24 @@
                 compNode = comp;
                 try {
                     var verb = ctx.createConvolver();
-                    verb.buffer = makeIR(1.6, 3.2);
+                    verb.buffer = makeIR(2.1, 3.0);
                     var vhp = ctx.createBiquadFilter();
                     vhp.type = "highpass";
-                    vhp.frequency.value = 220;
+                    vhp.frequency.value = 260;
+                    /* darkening the wet tail keeps the reverb spacious, not hissy */
+                    var vlp = ctx.createBiquadFilter();
+                    vlp.type = "lowpass";
+                    vlp.frequency.value = 6800;
+                    var predelay = ctx.createDelay(0.1);
+                    predelay.delayTime.value = 0.02;
                     var send = ctx.createGain();
                     send.gain.value = 0.22;
                     master.connect(vhp);
                     vhp.connect(send);
-                    send.connect(verb);
-                    verb.connect(comp);
+                    send.connect(predelay);
+                    predelay.connect(verb);
+                    verb.connect(vlp);
+                    vlp.connect(comp);
                     verbNode = verb;
                     verbSend = vhp;
                 } catch (e) {}
@@ -910,8 +918,12 @@
                 break;
             }
             case "snare": {
-                noiseHit(when, vel * 0.5, 0.002, 0.18, "highpass", 1800, 0, dest);
-                noiseHit(when, vel * 0.3, 0.001, 0.05, "bandpass", 3400, 0.9, dest);
+                /* crack (top), body (batter tone), shell (sides) - the classic
+                   three-part snare build, plus a stick transient */
+                clickHit(when, vel * 0.18, dest);
+                noiseHit(when, vel * 0.5, 0.002, 0.16, "highpass", 1500, 0, dest);
+                noiseHit(when, vel * 0.24, 0.001, 0.045, "bandpass", 3600, 1.1, dest);
+                noiseHit(when, vel * 0.14, 0.002, 0.08, "bandpass", 880, 0.8, dest);
                 var g2 = env(when, vel * 0.42, 0.002, 0.09, dest);
                 o = burst(190, "triangle", when, g2);
                 o.frequency.exponentialRampToValueAtTime(165, when + 0.09);
@@ -926,58 +938,98 @@
                 noiseHit(when + 0.011, vel * 0.28, 0.001, 0.02, "bandpass", 1150, 1.2, dest);
                 noiseHit(when + 0.022, vel * 0.36, 0.001, 0.025, "bandpass", 1200, 1.2, dest);
                 noiseHit(when + 0.034, vel * 0.45, 0.002, 0.16, "bandpass", 1250, 1.5, dest);
+                /* stereo-ish sparkle tail on a higher band keeps the clap airy */
+                noiseHit(when + 0.034, vel * 0.14, 0.002, 0.2, "bandpass", 4200, 0.9, dest);
                 break;
             }
             case "hihat_closed":
-                metalHat(when, vel * 0.28, 0.055, 9000, dest);
+                /* noise transient softens the squares' edge, then the metal ring */
+                noiseHit(when, vel * 0.1, 0.0005, 0.008, "highpass", 8000, 0, dest);
+                metalHat(when, vel * 0.3, 0.055, 8500, dest);
                 break;
             case "hihat_open":
-                metalHat(when, vel * 0.24, 0.42, 8000, dest);
+                noiseHit(when, vel * 0.08, 0.0005, 0.01, "highpass", 8000, 0, dest);
+                metalHat(when, vel * 0.24, 0.42, 7500, dest);
+                /* sustained sizzle under the ring so the open hat breathes */
+                noiseHit(when, vel * 0.07, 0.004, 0.4, "highpass", 6000, 0, dest);
                 break;
             case "tom": {
-                noiseHit(when, vel * 0.1, 0.002, 0.02, "lowpass", 900, 0, dest);
+                noiseHit(when, vel * 0.12, 0.002, 0.025, "lowpass", 900, 0, dest);
                 var gt = env(when, vel * 0.7, 0.003, 0.3, dest);
                 o = burst(210, "sine", when, gt);
                 o.frequency.exponentialRampToValueAtTime(92, when + 0.22);
                 o.start(when); o.stop(when + 0.35);
-                var go = env(when, vel * 0.12, 0.003, 0.16, dest);
-                var o2 = burst(420, "sine", when, go);
-                o2.frequency.exponentialRampToValueAtTime(185, when + 0.14);
-                o2.start(when); o2.stop(when + 0.22);
+                /* membrane overtone (~1.5x fundamental) gives the tuned skin */
+                var go = env(when, vel * 0.16, 0.003, 0.18, dest);
+                var o2 = burst(315, "triangle", when, go);
+                o2.frequency.exponentialRampToValueAtTime(138, when + 0.15);
+                o2.start(when); o2.stop(when + 0.24);
+                var go2 = env(when, vel * 0.1, 0.003, 0.12, dest);
+                var o4 = burst(420, "sine", when, go2);
+                o4.frequency.exponentialRampToValueAtTime(185, when + 0.12);
+                o4.start(when); o4.stop(when + 0.2);
+                /* stick accent for definition in a mix */
+                noiseHit(when, vel * 0.06, 0.001, 0.02, "bandpass", 1400, 1, dest);
                 break;
             }
             case "rim": {
+                /* two-pulse rimshot: bright metal tick + woody stick snap */
                 var gr = envFiltered(when, vel * 0.5, 0.001, 0.03, 1700, dest);
                 o = burst(1700, "square", when, gr);
                 o.start(when); o.stop(when + 0.05);
+                var gr2 = envFiltered(when, vel * 0.32, 0.001, 0.014, 480, dest);
+                var or2 = burst(480, "square", when, gr2);
+                or2.start(when); or2.stop(when + 0.03);
                 noiseHit(when, vel * 0.12, 0.001, 0.015, "highpass", 2200, 0, dest);
                 break;
             }
             case "cowbell": {
-                var gc = envFiltered(when, vel * 0.35, 0.001, 0.3, 2600, dest);
+                /* classic 808: 540+800 Hz squares through a bandpass, with a
+                   sharp attack burst then the ringing body */
+                var gc = envFiltered(when, vel * 0.3, 0.001, 0.26, 2600, dest);
                 var a = burst(540, "square", when, gc);
                 var b = burst(800, "square", when, gc);
-                a.start(when); a.stop(when + 0.35);
-                b.start(when); b.stop(when + 0.35);
+                a.start(when); a.stop(when + 0.32);
+                b.start(when); b.stop(when + 0.32);
+                var gca = envFiltered(when, vel * 0.34, 0.0008, 0.035, 2600, dest);
+                var a2 = burst(540, "square", when, gca);
+                var b2 = burst(800, "square", when, gca);
+                a2.start(when); a2.stop(when + 0.05);
+                b2.start(when); b2.stop(when + 0.05);
                 break;
             }
         }
     }
 
-    function pluckVoice(type, freq, when, dur, peak, dest) {
+    /* opts: from/to (Hz) add a lowpass that decays from to -> to for a
+       plucked-string brightness fall */
+    function pluckVoice(type, freq, when, dur, peak, dest, opts) {
         var hold = Math.max(0.12, dur);
         var g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, when);
         g.gain.exponentialRampToValueAtTime(Math.max(0.0005, peak), when + 0.006);
         g.gain.exponentialRampToValueAtTime(0.0001, when + hold);
-        g.connect(dest || master);
+        if (opts && opts.from) {
+            var f = ctx.createBiquadFilter();
+            f.type = "lowpass";
+            f.Q.value = 0.8;
+            f.frequency.setValueAtTime(opts.from, when);
+            f.frequency.exponentialRampToValueAtTime(opts.to || 500, when + hold * 0.7);
+            g.connect(f);
+            f.connect(dest || master);
+        } else {
+            g.connect(dest || master);
+        }
         var o = burst(freq, type, when, g);
         o.start(when);
         o.stop(when + hold + 0.05);
     }
 
-    function sustainVoice(type, freq, when, dur, peak, atk, rel, cutoff, vib, dest) {
+    /* opts: drop (semitones of pitch sag at onset, for punchy bass),
+       sweep (cutoff*2^semitones -> cutoff over sweep seconds, filter env) */
+    function sustainVoice(type, freq, when, dur, peak, atk, rel, cutoff, vib, dest, opts) {
         dest = dest || master;
+        opts = opts || {};
         var hold = Math.max(0.08, dur);
         var g = ctx.createGain();
         g.gain.setValueAtTime(0.0001, when);
@@ -987,13 +1039,18 @@
         if (cutoff) {
             var f = ctx.createBiquadFilter();
             f.type = "lowpass";
-            f.frequency.setValueAtTime(cutoff, when);
+            f.frequency.setValueAtTime(opts.sweep ? Math.min(18000, cutoff * Math.pow(2, opts.sweep / 12)) : cutoff, when);
+            if (opts.sweep) f.frequency.exponentialRampToValueAtTime(cutoff, when + (opts.sweep_time || 0.12));
             g.connect(f);
             f.connect(dest);
         } else {
             g.connect(dest);
         }
         var o = burst(freq, type, when, g);
+        if (opts.drop) {
+            o.frequency.setValueAtTime(freq * Math.pow(2, opts.drop / 12), when);
+            o.frequency.exponentialRampToValueAtTime(freq, when + (opts.drop_time || 0.05));
+        }
         if (vib) {
             var lfo = ctx.createOscillator();
             lfo.type = "sine";
@@ -1082,31 +1139,41 @@
         }
         switch (kind) {
             case "piano": {
+                /* layered: fundamental + stretched-string partials with a
+                   brightness fall, hammer noise, and a whisper of FM warmth */
                 var pd = Math.max(dur, 0.5) + vel * 0.5;
-                pluckVoice("triangle", f, when, pd, vel * 0.45, dest);
-                pluckVoice("sine", f * 2, when, pd * 0.55, vel * 0.14, dest);
+                pluckVoice("triangle", f, when, pd, vel * 0.42, dest, { from: Math.min(16000, f * 8), to: Math.max(400, f * 1.6) });
+                pluckVoice("triangle", f * 1.0015, when, pd * 0.9, vel * 0.14, dest);
+                pluckVoice("sine", f * 2, when, pd * 0.55, vel * 0.13, dest);
                 pluckVoice("sine", f * 3, when, pd * 0.3, vel * 0.05, dest);
                 noiseHit(when, vel * 0.05, 0.001, 0.025, "lowpass", 900, 0, dest);
+                noiseHit(when, vel * 0.025, 0.0005, 0.006, "highpass", 3000, 0, dest);
+                fmHit(FM_EP, f, when, vel * 0.1, Math.max(0.05, dur) * 0.6, dest);
                 break;
             }
             case "pluck":
-                pluckVoice("triangle", f, when, Math.min(dur, 0.35), vel * 0.42, dest);
+                pluckVoice("triangle", f, when, Math.min(dur, 0.35), vel * 0.42, dest, { from: Math.min(16000, f * 7), to: Math.max(350, f * 1.2) });
                 pluckVoice("triangle", f * 1.003, when, Math.min(dur, 0.28), vel * 0.18, dest);
                 pluckVoice("sine", f * 2, when, Math.min(dur, 0.12), vel * 0.12, dest);
                 break;
             case "bass":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.45, 0.008, 0.08, Math.min(f * 3.5, 950), null, dest);
-                sustainVoice("sine", Math.max(30, f * 0.5), when, dur, vel * 0.25, 0.015, 0.08, 0, null, dest);
+                /* filter-env saw with pitch sag for a punchy attack, clean sub underneath */
+                sustainVoice("sawtooth", f, when, dur, vel * 0.45, 0.008, 0.08, Math.min(f * 3.5, 950), null, dest,
+                    { drop: 6, drop_time: 0.04, sweep: 26, sweep_time: 0.1 });
+                sustainVoice("square", f * 1.004, when, dur, vel * 0.09, 0.01, 0.08, Math.min(f * 2.2, 650), null, dest);
+                sustainVoice("sine", Math.max(30, f * 0.5), when, dur, vel * 0.28, 0.015, 0.08, 0, null, dest);
                 break;
             case "lead":
-                sustainVoice("square", f, when, dur, vel * 0.24, 0.01, 0.06, 3200, { rate: 5.8, depth: 8, delay: 0.25 }, dest);
+                sustainVoice("square", f, when, dur, vel * 0.22, 0.01, 0.06, 3200, { rate: 5.8, depth: 8, delay: 0.25 }, dest);
                 sustainVoice("sawtooth", f * 1.005, when, dur, vel * 0.1, 0.01, 0.06, 3200, { rate: 5.8, depth: 8, delay: 0.25 }, dest);
+                sustainVoice("sawtooth", f * 0.995, when, dur, vel * 0.08, 0.012, 0.06, 2400, { rate: 5.8, depth: 8, delay: 0.3 }, dest);
                 break;
             case "pad":
                 padVoice(f, when, dur, vel, dest);
                 break;
             case "bells":
-                pluckVoice("sine", f, when, Math.max(dur, 1.2), vel * 0.4, dest);
+                pluckVoice("sine", f, when, Math.max(dur, 1.2), vel * 0.38, dest, { from: 9000, to: 1200 });
+                pluckVoice("sine", f * 2.01, when, Math.max(dur, 1.2) * 0.85, vel * 0.09, dest);
                 pluckVoice("sine", f * 2.76, when, Math.max(dur, 1.2) * 0.6, vel * 0.13, dest);
                 pluckVoice("sine", f * 5.4, when, Math.max(dur, 1.2) * 0.3, vel * 0.06, dest);
                 break;
@@ -1114,27 +1181,34 @@
                 sustainVoice("sine", f, when, dur, vel * 0.4, 0.01, 0.12, 0, null, dest);
                 break;
             case "square":
-                sustainVoice("square", f, when, dur, vel * 0.22, 0.01, 0.1, Math.min(f * 6, 9000), null, dest);
+                sustainVoice("square", f, when, dur, vel * 0.2, 0.01, 0.1, Math.min(f * 6, 9000), null, dest);
+                sustainVoice("square", f * 1.004, when, dur, vel * 0.08, 0.012, 0.1, Math.min(f * 4, 6000), null, dest);
                 break;
             case "triangle":
-                sustainVoice("triangle", f, when, dur, vel * 0.35, 0.01, 0.12, 0, null, dest);
+                sustainVoice("triangle", f, when, dur, vel * 0.33, 0.01, 0.12, 0, null, dest);
+                sustainVoice("sine", f * 2, when, dur * 0.7, vel * 0.05, 0.02, 0.12, 0, null, dest);
                 break;
             case "saw":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.28, 0.01, 0.1, Math.min(f * 5, 8000), null, dest);
+                sustainVoice("sawtooth", f, when, dur, vel * 0.22, 0.01, 0.1, Math.min(f * 5, 8000), null, dest);
+                sustainVoice("sawtooth", f * 1.006, when, dur, vel * 0.14, 0.014, 0.1, Math.min(f * 3.5, 6000), null, dest);
                 break;
             case "organ":
-                sustainVoice("sine", f, when, dur, vel * 0.28, 0.02, 0.15, 0, null, dest);
-                sustainVoice("sine", f * 2, when, dur, vel * 0.16, 0.02, 0.15, 0, null, dest);
-                sustainVoice("sine", f * 3, when, dur, vel * 0.09, 0.02, 0.15, 0, null, dest);
-                sustainVoice("sine", f * 4, when, dur, vel * 0.05, 0.02, 0.15, 0, null, dest);
+                /* B3 drawbars: key click transient, slight Leslie wobble */
+                pluckVoice("sine", f * 3, when, 0.04, vel * 0.1, dest);
+                sustainVoice("sine", f, when, dur, vel * 0.26, 0.02, 0.15, 0, { rate: 6.2, depth: 4, delay: 0.1 }, dest);
+                sustainVoice("sine", f * 2, when, dur, vel * 0.15, 0.02, 0.15, 0, { rate: 6.2, depth: 4, delay: 0.1 }, dest);
+                sustainVoice("sine", f * 3, when, dur, vel * 0.08, 0.02, 0.15, 0, { rate: 6.2, depth: 4, delay: 0.15 }, dest);
+                sustainVoice("sine", f * 4, when, dur, vel * 0.05, 0.02, 0.15, 0, { rate: 6.2, depth: 4, delay: 0.15 }, dest);
+                sustainVoice("sine", f * 0.5, when, dur, vel * 0.07, 0.03, 0.15, 0, { rate: 6.2, depth: 4, delay: 0.2 }, dest);
                 break;
             case "strings":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.17, 0.09, 0.35, Math.min(f * 3, 3000), { rate: 5.2, depth: 7, delay: 0.4 }, dest);
-                sustainVoice("sawtooth", f * 1.008, when, dur, vel * 0.15, 0.1, 0.35, Math.min(f * 3, 3000), { rate: 5.5, depth: 7, delay: 0.5 }, dest);
+                sustainVoice("sawtooth", f, when, dur, vel * 0.16, 0.09, 0.35, Math.min(f * 3, 3000), { rate: 5.2, depth: 7, delay: 0.4 }, dest);
+                sustainVoice("sawtooth", f * 1.008, when, dur, vel * 0.14, 0.1, 0.35, Math.min(f * 3, 3000), { rate: 5.5, depth: 7, delay: 0.5 }, dest);
                 sustainVoice("sawtooth", f * 0.995, when, dur, vel * 0.12, 0.11, 0.35, Math.min(f * 3, 3000), { rate: 4.9, depth: 7, delay: 0.45 }, dest);
+                sustainVoice("sawtooth", f * 0.5, when, dur, vel * 0.09, 0.16, 0.35, Math.min(f * 2, 1500), { rate: 4.6, depth: 6, delay: 0.6 }, dest);
                 break;
             case "synbrass":
-                sustainVoice("sawtooth", f, when, dur, vel * 0.22, 0.03, 0.12, Math.min(f * 8, 4500), { rate: 5, depth: 5, delay: 0.4 }, dest);
+                sustainVoice("sawtooth", f, when, dur, vel * 0.22, 0.03, 0.12, Math.min(f * 8, 4500), { rate: 5, depth: 5, delay: 0.4 }, dest, { sweep: 18, sweep_time: 0.18 });
                 sustainVoice("square", f * 1.006, when, dur, vel * 0.1, 0.03, 0.12, Math.min(f * 6, 3500), { rate: 5, depth: 5, delay: 0.4 }, dest);
                 break;
             case "flute":
