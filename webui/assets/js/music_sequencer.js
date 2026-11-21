@@ -27,6 +27,10 @@
     var curChat = null;
     var loops = new Map();
     var sounds = new Map();
+    /* user audio files (samples/fx/ + samples/song/) -> name: {file, url, kind,
+       buffer, loading, failed}; buffers decode lazily and are prefetched on chat load */
+    var samples = new Map();
+    var sampleQueue = [];
     var visualCues = new Map();
     var vizEl = null;
     var vizQueue = [];
@@ -1425,6 +1429,68 @@
         }
     }
 
+    /* -------------------------
+     * user samples: audio files from webui/assets/samples/{fx,song}/ served
+     * via /ext-assets/. fx samples are drum voices; song samples fire as
+     * arrangement events (see gateSong's event pass).
+     * ------------------------- */
+    function loadSampleBuffer(ent) {
+        if (!ent || ent.buffer || ent.loading || ent.failed) return;
+        if (!ctx) { tryUnlock(); if (!ctx) return; }
+        ent.loading = true;
+        fetch(ent.url).then(function (r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.arrayBuffer();
+        }).then(function (b) {
+            return ctx.decodeAudioData(b);
+        }).then(function (buf) {
+            ent.buffer = buf;
+            ent.loading = false;
+        }).catch(function (e) {
+            ent.failed = true;
+            ent.loading = false;
+            console.warn("[music_sequencer] sample could not be loaded: " + (ent.url || "?"), e);
+        });
+    }
+
+    function fireSample(buf, when, vel, dest, pan, rate) {
+        if (!ctx) return;
+        var w = Math.max(when, ctx.currentTime + 0.004);
+        var src = ctx.createBufferSource();
+        src.buffer = buf;
+        /* note samples re-fire pitched to each note (rate = 2^((midi-60)/12),
+           C4 reference); fx and song events play at natural pitch */
+        if (rate && rate !== 1) src.playbackRate.value = Math.max(0.06, Math.min(16, rate));
+        var g = ctx.createGain();
+        g.gain.value = Math.max(0, Math.min(1, vel == null ? 1 : vel));
+        src.connect(g);
+        if (pan && ctx.createStereoPanner) {
+            var pn = ctx.createStereoPanner();
+            pn.pan.value = Math.max(-1, Math.min(1, pan));
+            g.connect(pn);
+            pn.connect(dest || master);
+        } else g.connect(dest || master);
+        src.start(w);
+    }
+
+    /* hits are scheduled ~lookahead ahead; a sample whose decode is still
+       running parks in sampleQueue and fires from rAF the moment its buffer
+       is ready (exactly on time when decode beats the lookahead, late-
+       rather-than-never when it does not) */
+    function sampleAudio(name, when, vel, dest, pan, rate) {
+        var ent = samples.get(String(name));
+        if (!ent || ent.failed) return false;
+        if (!ent.buffer) {
+            loadSampleBuffer(ent);
+            if (!ent.buffer) {
+                sampleQueue.push({ ent: ent, t: when, vel: vel, dest: dest, pan: pan, rate: rate });
+                return true;
+            }
+        }
+        fireSample(ent.buffer, when, vel, dest, pan, rate);
+        return true;
+    }
+
     function drumHit(name, when, vel, dest) {
         dest = dest || master;
         var custom = sounds.get(String(name));
@@ -1432,6 +1498,7 @@
             customHit(custom, midiToFreq(custom.base_note || 36), when, vel, null, dest);
             return;
         }
+        if (samples.has(String(name))) { sampleAudio(name, when, vel, dest, 0); return; }
         var o;
         switch (name) {
             case "kick": {
@@ -1663,6 +1730,9 @@
             customHit(custom, f, when, vel, Math.max(0.05, dur), dest);
             return;
         }
+        /* note samples: every note re-fires the file pitched to it (C4
+           reference); it rings its natural length, chords stack copies */
+        if (samples.has(String(kind))) { sampleAudio(kind, when, vel, dest, 0, Math.pow(2, ((Number(midi) || 60) - 60) / 12)); return; }
         switch (kind) {
             case "piano": {
                 /* layered: fundamental + stretched-string partials with a
@@ -1887,7 +1957,7 @@
 
     var SHADER_DOM_FALLBACK = {
         ripple: "bloom",
-        wave: "tick",
+        wave: "drip",
         plasma: "bloom",
         aurora: "bloom",
         prism: "laser",
@@ -1906,7 +1976,14 @@
 
         var fallback = SHADER_DOM_FALLBACK[effect] || effect;
         if (fallback === "spark") { spawnPulse("msq-spark-dot", cell ? cell.x : 50, cell ? cell.y : 62, color); return; }
-        if (fallback === "tick") { spawnPulse("msq-tick-bar", cell ? cell.x : 50, 0, color); return; }
+        if (fallback === "drip") {
+            /* same 4-octave absolute-pitch spread as the shader (C2 left .. C6 right) */
+            var dx = midi != null && isFinite(Number(midi))
+                ? 4 + 92 * Math.max(0, Math.min(48, Math.round(Number(midi)) - 36)) / 48
+                : (cell ? cell.x : 50);
+            spawnPulse("msq-drip-bar", dx, 0, color);
+            return;
+        }
         if (fallback === "laser") { fireLaser(cell, color); return; }
         if (fallback === "flash") { spawnPulse("msq-flash-full", null, null, color); return; }
         if (fallback === "bloom") {
@@ -1933,6 +2010,19 @@
         requestAnimationFrame(pumpViz);
         var fx = window.MusicSequencerShaderFx;
         if (fx && ambientDirty) syncAmbientDefs();
+        if (ctx && sampleQueue.length) {
+            var keepS = [];
+            for (var qi = 0; qi < sampleQueue.length; qi++) {
+                var q = sampleQueue[qi];
+                if (q.ent.failed) continue;
+                if (!q.ent.buffer) {
+                    loadSampleBuffer(q.ent);
+                    if (!q.ent.buffer) { keepS.push(q); continue; }
+                }
+                fireSample(q.ent.buffer, Math.max(q.t, ctx.currentTime), q.vel, q.dest, q.pan, q.rate);
+            }
+            sampleQueue = keepS;
+        }
         if (ctx && vizQueue.length) {
             var now = ctx.currentTime - VIZ_LEAD;
             var keep = [];
@@ -2069,6 +2159,8 @@
             song.startStep = nextBarStart();
             song.bIdx = 0;
             song.bStep = song.startStep;
+            song.pass = 0;
+            song.fired = [];
         }
         var horizon = absStep(ctx.currentTime + LOOKAHEAD);
         while (song && horizon >= song.bStep) {
@@ -2078,6 +2170,9 @@
             var bars = sec ? sec.bars : 0;
             applyBoundary(step, sec);
             if (song) {
+                /* wrapping back to the first section starts a new pass: song
+                   sample events fire once per pass, so arm them again */
+                if (sec && song.bIdx === n - 1 && song.def.loop) { song.pass = (song.pass || 0) + 1; song.fired = []; }
                 song.bIdx = song.bIdx + 1 >= n && song.def.loop ? 0 : song.bIdx + 1;
                 if (song.bIdx >= n) song.bStep = song.startStep + (song.def.total_bars || 1) * stepsPerBar;
                 else song.bStep = step + bars * stepsPerBar;
@@ -2090,6 +2185,25 @@
         var nowStep = absStep(ctx.currentTime);
         var horizonStep = absStep(ctx.currentTime + LOOKAHEAD);
         gateSong();
+        /* song sample events: one-shots anchored at
+           startStep + pass * total_bars + at, so a looping song re-fires them
+           every cycle (gateSong re-arms `fired` on the wrap) */
+        if (song && song.startStep >= 0 && song.def && song.def.events && song.def.events.length) {
+            if (!song.fired) song.fired = [];
+            var evBase = song.startStep + (song.pass || 0) * (song.def.total_bars || 0) * stepsPerBar;
+            for (var ei = 0; ei < song.def.events.length; ei++) {
+                if (song.fired[ei]) continue;
+                var ev = song.def.events[ei];
+                var estep = evBase + (Number(ev.at) || 0) * stepsPerBar;
+                /* resuming a half-played song starts it from the top: events
+                   already behind the playhead are consumed, not machine-gunned */
+                if (estep < nowStep - 0.05) { song.fired[ei] = true; continue; }
+                if (estep <= horizonStep) {
+                    song.fired[ei] = true;
+                    sampleAudio(ev.sample, stepTime(estep), ev.volume == null ? 1 : ev.volume, master, ev.pan || 0);
+                }
+            }
+        }
         loops.forEach(function (loop, id) {
             if (!loop.playing || loop.nextStep < 0 || !loop.def) return;
             var span = (loop.def.bar_length || 1) * stepsPerBar;
@@ -2189,6 +2303,7 @@
     function stopAll() {
         loops.forEach(function (e) { e.playing = false; e.nextStep = -1; e.sched = -1; e.stopAt = Infinity; });
         vizQueue = [];
+        sampleQueue = [];
         if (window.MusicSequencerShaderFx) window.MusicSequencerShaderFx.clear();
     }
 
@@ -2345,6 +2460,13 @@
             sounds.forEach(function (spec, name) { out.push({ name: name, spec: spec }); });
             return out;
         },
+        listSamples: function () {
+            var out = [];
+            samples.forEach(function (ent, name) {
+                out.push({ name: name, kind: ent.kind || null, url: ent.url, ready: !!ent.buffer, failed: !!ent.failed });
+            });
+            return out;
+        },
         getAudioTime: function () {
             if (ctx && ctx.state === "running") return ctx.currentTime;
             return window.performance ? performance.now() / 1000 : Date.now() / 1000;
@@ -2395,6 +2517,8 @@
         panicAudio();
         loops.clear();
         sounds.clear();
+        samples.clear();
+        sampleQueue = [];
         visualCues.clear();
         vizQueue = [];
         ambientDefs = [];
@@ -2419,6 +2543,11 @@
                 if (d.meter) setMeter(d.meter);
                 var sd = d.sounds || {};
                 Object.keys(sd).forEach(function (sn) { sounds.set(sn, sd[sn]); });
+                var smp = d.samples || {};
+                Object.keys(smp).forEach(function (sn) {
+                    samples.set(sn, smp[sn]);
+                    if (ctx) loadSampleBuffer(smp[sn]);
+                });
                 var vc = d.visuals || {};
                 Object.keys(vc).forEach(function (vn) {
                     var vfx = String(vc[vn] || "").toLowerCase();
@@ -2458,6 +2587,21 @@
         var sel = selectedChat();
         if (data.chat && String(data.chat) !== String(sel)) return;
         if (t === "music_sequencer:play") play(data.loop || {}, (data.loop || {}).id);
+        else if (t === "music_sequencer:define") {
+            /* stored pattern: kept known (for song gating and the layer list)
+               without playing; a later play/start of the same id replaces it */
+            var dd = data.loop || {};
+            if (dd.id && !loops.has(String(dd.id))) {
+                loops.set(String(dd.id), { def: dd, volume: clamp01(dd.volume == null ? 1 : dd.volume), playing: false, nextStep: -1 });
+            } else if (dd.id) {
+                var ex = loops.get(String(dd.id));
+                if (!ex.playing) {
+                    destroyChain(ex);
+                    ex.def = dd;
+                    ex.volume = clamp01(dd.volume == null ? 1 : dd.volume);
+                }
+            }
+        }
         else if (t === "music_sequencer:stop") stop(data.id);
         else if (t === "music_sequencer:stop_all") panicAudio();
         else if (t === "music_sequencer:tempo") setTempo(data.bpm);
@@ -2473,6 +2617,17 @@
         else if (t === "music_sequencer:sound") {
             if (data.spec) sounds.set(String(data.name), data.spec);
             else sounds.delete(String(data.name));
+        }
+        else if (t === "music_sequencer:samples") {
+            /* live folder refresh (list_samples): swap in the new map and
+               prefetch what we can, dropping hits parked for old files */
+            samples.clear();
+            sampleQueue = [];
+            var sm = data.samples || {};
+            Object.keys(sm).forEach(function (sn) {
+                samples.set(sn, sm[sn]);
+                if (ctx) loadSampleBuffer(sm[sn]);
+            });
         }
         else if (t === "music_sequencer:visual") {
             var sfx = data.effect ? String(data.effect) : null;

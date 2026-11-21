@@ -4,7 +4,7 @@
         flash: 1,
         bloom: 3,
         spark: 4,
-        tick: 5,
+        drip: 5,
         laser: 6,
         ripple: 7,
         wave: 8,
@@ -24,7 +24,7 @@
         flash: 0.45,
         bloom: 0.80,
         spark: 0.50,
-        tick: 0.90,
+        drip: 0.90,
         laser: 0.18,
         ripple: 0.90,
         wave: 0.90,
@@ -241,7 +241,7 @@ vec4 sparkFogFx(vec2 uv, vec2 c, vec3 col, float t, float seed, float strength, 
     return fogScatter(col, (cloud * 0.75 + trailCloud * 0.22) * strength * fog * shimmer, 3.25, 0.68);
 }
 
-vec4 tickFogFx(vec2 uv, vec2 raw, vec3 col, float t, float seed, float strength, float fog) {
+vec4 dripFogFx(vec2 uv, vec2 raw, vec3 col, float t, float seed, float strength, float fog) {
     if (fog <= 0.0005) return vec4(0.0);
     float yy = 1.0 - uv.y;
     float x = abs(uv.x - raw.x);
@@ -391,9 +391,11 @@ vec4 sparkFx(vec2 uv, vec2 c, vec3 col, float t, float seed, float strength) {
     return vec4(outc, a);
 }
 
-vec4 tickFx(vec2 uv, vec2 raw, vec2 c, vec3 col, float t, float seed, float strength) {
+vec4 dripFx(vec2 uv, vec2 raw, vec2 c, vec3 col, float t, float seed, float strength) {
     /* raindrop: a bright bead drips off the top edge and accelerates down
-       (gravity ramp), thin wet trail above it, exits past the bottom */
+       (gravity ramp), thin wet trail above it, exits past the bottom. The
+       host rides raw.x with absolute pitch across a 4-octave span (C2-C6),
+       so low notes drip at the left, high notes at the right. */
     float yy = 1.0 - uv.y;
     float x = uv.x - raw.x;
     float fall = 1.22 * (0.12 * t + 0.88 * t * t);
@@ -835,8 +837,8 @@ void main() {
             fogFx = sparkFogFx(uv, c, col, t, seed, strength, fog);
         }
         else if (typ == 5) {
-            fx = tickFx(uv, raw, c, col, t, seed, strength);
-            fogFx = tickFogFx(uv, raw, col, t, seed, strength, fog);
+            fx = dripFx(uv, raw, c, col, t, seed, strength);
+            fogFx = dripFogFx(uv, raw, col, t, seed, strength, fog);
         }
         else if (typ == 6) {
             vec2 origin = vec2(uParam[i].y, uParam[i].z);
@@ -1374,6 +1376,12 @@ void main() {
 
         var cx = cell && cell.x != null ? clamp(Number(cell.x) / 100, 0, 1) : 0.5;
         var cy = cell && cell.y != null ? clamp(Number(cell.y) / 100, 0, 1) : 0.56;
+        /* drips ignore the shared pitch-class column grid and ride absolute
+           pitch instead: C2 lands far left, C6 far right, so the effect
+           spans four octaves rather than wrapping every octave */
+        if (name === "drip" && midi != null && isFinite(Number(midi))) {
+            cx = clamp(0.04 + 0.92 * (Math.round(Number(midi)) - 36) / 48, 0.02, 0.98);
+        }
         var base = DEFAULT_DUR[name] || 0.65;
         var d = Number(dur);
         var duration = d > 0 ? Math.max(0.16, Math.min(2.4, base * 0.65 + d * 0.85)) : base;
